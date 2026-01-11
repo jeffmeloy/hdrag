@@ -1,0 +1,11 @@
+torch
+transformers
+accelerate
+safetensors
+huggingface_hub
+numpy
+pandas
+pyarrow
+gradio
+plotly
+PyYAML
