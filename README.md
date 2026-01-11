@@ -1,6 +1,4 @@
-# HdRAG: Technical Specification
-
-HdRAG is a hyperdimensional computing (HDC) based retrieval-augmented generation system. It implements a local-first pipeline using ternary hypervectors for document indexing and retrieval.
+# HdRAG: A hyperdimensional computing (HDC) based retrieval-augmented generation system. It implements a local-first pipeline using ternary hypervectors for document indexing and retrieval.
 
 ## System Architecture
 
