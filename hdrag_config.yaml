@@ -1,8 +1,8 @@
 # Directories
 chat_history_dir: ./chat_history/       # Where conversation logs are saved as JSONL
 hdrag_dir: ./hdrag_data/                # SQLite DB, HDV binary, and projection matrix
-datasets_dir: D:/datasets/              # Source JSON/JSONL files to index
-model_dir: D:/models/safetensors/input_models/  # HuggingFace model cache location
+datasets_dir: ./datasets/              # Source JSON/JSONL files to index
+model_dir: ./models/  # HuggingFace model cache location
 
 # Model
 model_name: "p-e-w/Qwen3-4B-Instruct-2507-heretic"  # HF repo ID or local path
@@ -15,7 +15,7 @@ max_length_tokens: 16384                # Truncation limit for input tokenizatio
 hdc_dimensions: 10000                   # Hypervector dimensionality (higher = more fidelity, more RAM)
 hdc_seed: 42                            # RNG seed for reproducible random projection matrix
 
-# .txt file chunking
+# .txt file chunking (for .txt
 text_chunk_size: 1024                   # max chunk size for .txt files in dataset 
 text_chunk_overlap: 128                 # text chunk overlap for .txt file in dataset
 
@@ -39,4 +39,5 @@ gradio_port: 7860                       # Local port for Gradio web interface
 
 # Prompt
 system_prompt: |                        # Injected before retrieved context in chat
-  As I consider the user's message, these vague recollections surface from my own working memory that could inform my responses. My memory is incomplete, so I will treat these recollections as notions rather than facts.
+  As I consider the user's message, these recollections my working memory that could inform my responses. My memory is incomplete, so I will treat these recollections as notions rather than facts.
+
