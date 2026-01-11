@@ -1,4 +1,5 @@
-# HdRAG: A hyperdimensional computing (HDC) based retrieval-augmented generation system. It implements a local-first pipeline using ternary hypervectors for document indexing and retrieval.
+# HdRAG: Hyperdimensional Retrieval-Augmented Generation 
+HdRAG is a hyperdimensional computing (HDC) based retrieval-augmented generation system that implements a local-first pipeline using ternary hypervectors for document indexing and retrieval.
 
 ## System Architecture
 
