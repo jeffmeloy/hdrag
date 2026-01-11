@@ -1,0 +1,42 @@
+# Directories
+chat_history_dir: ./chat_history/       # Where conversation logs are saved as JSONL
+hdrag_dir: ./hdrag_data/                # SQLite DB, HDV binary, and projection matrix
+datasets_dir: D:/datasets/              # Source JSON/JSONL files to index
+model_dir: D:/models/safetensors/input_models/  # HuggingFace model cache location
+
+# Model
+model_name: "p-e-w/Qwen3-4B-Instruct-2507-heretic"  # HF repo ID or local path
+temperature: 0.7                        # Sampling temperature for generation
+top_p: 0.9                              # Nucleus sampling threshold
+max_new_tokens: 4096                    # Max tokens to generate per response
+max_length_tokens: 16384                # Truncation limit for input tokenization
+
+# HDC Encoding
+hdc_dimensions: 10000                   # Hypervector dimensionality (higher = more fidelity, more RAM)
+hdc_seed: 42                            # RNG seed for reproducible random projection matrix
+
+# .txt file chunking
+text_chunk_size: 1024                   # max chunk size for .txt files in dataset 
+text_chunk_overlap: 128                 # text chunk overlap for .txt file in dataset
+
+# Indexing
+batch_size: 4                           # Documents per embedding batch (GPU memory bound)
+vocab_chunk_multiplier: 8               # Vocab pass processes batch_size * this many docs at once
+hash_digest_size: 8                     # Blake2b digest bytes for document IDs (8 = 64-bit)
+export_log_interval: 100000             # Log progress every N vectors during HDV export
+batch_log_interval: 1000                 # Log progress every N batches during encoding
+
+# Retrieval
+max_context_tokens: 8192                # Token budget for retrieved context in prompt
+min_context: 6                          # include at least these many dataset items 
+
+# Database
+sqlite_max_vars: 900                    # Chunk size for IN clauses (SQLite limit ~999)
+sqlite_cache_kb: 64000                  # SQLite page cache size in KB (64MB)
+
+# UI
+gradio_port: 7860                       # Local port for Gradio web interface
+
+# Prompt
+system_prompt: |                        # Injected before retrieved context in chat
+  As I consider the user's message, these vague recollections surface from my own working memory that could inform my responses. My memory is incomplete, so I will treat these recollections as notions rather than facts.
