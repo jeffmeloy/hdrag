@@ -23,8 +23,8 @@ Document representation is generated through the following sequence:
 1.  **Tokenization:** Text is processed via a HuggingFace tokenizer.
 2.  **Embedding Extraction:** Hidden states are extracted from the model's embedding table.
 3.  **IDF-Weighted Pooling:** Token embeddings are aggregated using an Inverse Document Frequency (IDF) weighted mean pool.
-4.  **Random Projection:** The resulting vector is projected via a fixed Gaussian random matrix ($\mathbb{R}^d \rightarrow \mathbb{R}^D$), where $D$ is typically $\geq 10,000$.
-5.  **Ternarization:** Values are thresholded at $\pm 1/\sqrt{d}$ to produce a ternary hypervector (HDV) containing elements in $\{-1, 0, +1\}$.
+4.  **Random Projection:** The resulting vector is projected via a fixed Gaussian random matrix.
+5.  **Ternarization:** Values are thresholded at 1/sqrt{d} to produce a ternary hypervector (HDV) containing elements in {-1, 0, +1}.
 6.  **Bitmap Packing:** The HDV is stored as two bitmasks (Positive and Negative) packed into `uint64` arrays.
 
 ### 2. Search and Retrieval
@@ -54,7 +54,7 @@ Retrieved results undergo three stages of filtering:
 | Component | Format |
 | :--- | :--- |
 | **HDV Dimensions** | Default 10,000+ (User configurable) |
-| **HDV Type** | Ternary ($\pm 1, 0$) |
+| **HDV Type** | Ternary (1, 0, -1) |
 | **Bitmap Storage** | `uint8` packed, `uint64` aligned for SWAR |
 | **IDF Storage** | SQLite `idf` table (token_id, weight) |
 | **Mmap Access** | `PROT_READ` / `ACCESS_READ` |
@@ -133,6 +133,7 @@ class Config:
     # Retrieval
     max_context_tokens: int
     min_context: int
+    max_k: int
     # Database
     sqlite_max_vars: int
     sqlite_cache_kb: int
@@ -645,7 +646,7 @@ class Database:
             self._mmap_fd = None
 
     def search(
-        self, q_pos: np.ndarray, q_neg: np.ndarray, k: int = 100
+        self, q_pos: np.ndarray, q_neg: np.ndarray, k: int
     ) -> tuple[list[int], list[float]]:
         if self._pos_bits is None:
             return [], []
@@ -662,7 +663,7 @@ class Database:
 
         n_cols = d_pos_64.shape[1]
         sample_cols = max(1, n_cols // 10)
-        n_candidates = min(k * 10, n)
+        n_candidates = min(k, n)
         cand_sets = []
         for _ in range(2):  # Contiguous slice - view, no copy
             start = np.random.randint(0, n_cols - sample_cols + 1)
@@ -684,7 +685,6 @@ class Database:
         top_k = min(k, len(scores))
         top_pos = np.argpartition(scores, -top_k)[-top_k:]
         top_pos = top_pos[np.argsort(scores[top_pos])[::-1]]
-
         return cand_idx[top_pos].tolist(), scores[top_pos].tolist()
 
     def _score_bitmap_64(
@@ -996,7 +996,6 @@ class Retriever:
         self.config = config
         self.logger = logger
         self._turns: list[torch.Tensor] = []
-        self._survival = 0.7
 
     def add_turn(self, text: str) -> None:
         emb = self.model.extract_embeddings([text]).squeeze(0).cpu()
@@ -1017,17 +1016,14 @@ class Retriever:
         blended = (torch.stack(all_embs) * weights.unsqueeze(-1)).sum(0)
         return F.normalize(blended.unsqueeze(0), p=2, dim=1)
 
-    def _target_k(self, budget: int) -> int:
-        median = self.hdc.median_doc_length or 256
-        return max(int(math.ceil(budget / median / self._survival)), 10)
-
     def search(self, query: str, token_budget: int, track: bool = True) -> list[dict]:
+        """Search for relevant documents within token budget."""
         if self.db.count() == 0:
             return []
 
-        k = self._target_k(token_budget)
-        self.logger.info(f"[Search] k={k} (survival={self._survival:.2f})")
+        self.logger.info(f"[Search] max_k={self.config.max_k}")
 
+        # Get query embedding
         query_emb = self.model.extract_embeddings([query])
         if track:
             search_emb = self._blend(query_emb)
@@ -1039,48 +1035,51 @@ class Retriever:
         bitmaps = self.hdc.encode(search_emb)
         q_pos, q_neg = bitmaps["pos"], bitmaps["neg"]
 
-        indices, scores = self.db.search(q_pos, q_neg, k)
+        # Search database (returns up to max_k refined results)
+        indices, scores = self.db.search(q_pos, q_neg, self.config.max_k)
         if not indices:
             return []
 
-        # Length-normalize and rank
+        # Get token counts
         token_counts = self.db.get_token_counts(indices)
+        
+        # Sort by raw score (no length normalization)
         ranked = sorted(
-            [
-                (i, s, s / math.sqrt(token_counts.get(i, 1)), token_counts.get(i, 1))
-                for i, s in zip(indices, scores)
-            ],
-            key=lambda x: x[2],
-            reverse=True,
+            [(i, s, token_counts.get(i, 1)) for i, s in zip(indices, scores)],
+            key=lambda x: x[1],
+            reverse=True
         )
 
-        # Fill recall budget
-        selected, used, whales = [], 0, 0
+        # Filter whales (diversity constraint)
+        selected, whales = [], 0
         max_doc_size = token_budget / self.config.min_context
-        for idx, raw, _, tc in ranked:
+        
+        for idx, score, tc in ranked:
             if tc > max_doc_size:
                 whales += 1
-                continue  # whale filter
-            if used + tc <= token_budget * 2:
-                selected.append((idx, raw))
-                used += tc
+                continue
+            selected.append((idx, score, tc))
 
         if not selected:
             return []
 
-        self.logger.info(
-            f"[Search] Filtered {whales} whale(s) > {max_doc_size:.0f} tokens"
-        )
+        if whales > 0:
+            self.logger.info(
+                f"[Search] Filtered {whales} whale(s) > {max_doc_size:.0f} tokens"
+            )
 
+        # Get memories for deduplication
         sel_idx = [s[0] for s in selected]
-        score_map = dict(selected)
+        score_map = {s[0]: s[1] for s in selected}
         memories = self.db.get_memories(sel_idx)
 
-        # Dedup
+        # Deduplication (maintains score order)
         if len(sel_idx) > 1:
-            temp = [
-                {"memory": memories[i], "hdv_idx": i} for i in sel_idx if i in memories
-            ]
+            temp = []
+            for i in sel_idx:
+                if i in memories:
+                    temp.append({"memory": memories[i], "hdv_idx": i})
+            
             bitmaps = self.db.get_bitmaps(sel_idx)
             deduped, _ = self.dedup.dedup(temp, bitmaps)
         else:
@@ -1088,26 +1087,21 @@ class Retriever:
                 {"memory": memories[i], "hdv_idx": i} for i in sel_idx if i in memories
             ]
 
-        # Update survival EMA
-        if selected:
-            self._survival = 0.1 * (len(deduped) / len(selected)) + 0.9 * self._survival
-
-        # Final budget-constrained selection
+        # Fill token budget greedily (results already in score order)
         results, final_tokens = [], 0
         for r in deduped:
             tc = r["memory"].get("token_count", 0)
             if final_tokens + tc <= token_budget:
-                results.append(
-                    {
-                        "memory": r["memory"],
-                        "hdc_score": score_map.get(r["hdv_idx"], 0.0),
-                    }
-                )
+                results.append({
+                    "memory": r["memory"],
+                    "hdc_score": score_map.get(r["hdv_idx"], 0.0),
+                })
                 final_tokens += tc
 
         self.logger.info(
             f"[Search] {len(selected)}→{len(deduped)}→{len(results)} ({final_tokens:,} tokens)"
         )
+        
         return results
 
 
