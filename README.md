@@ -38,7 +38,7 @@ Traditional RAG systems rely on dense vector databases, HdRAG uses a fundamental
 
 ```bash
 # Clone repository
-git clone https://github.com/youruser/hdrag.git
+git clone https://github.com/jeffmeloy/hdrag.git
 cd hdrag
 
 # Create environment
