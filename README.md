@@ -37,7 +37,6 @@ Retrieved results undergo three stages of filtering:
 ### 4. Conversation and Context Management
 *   **Recency-Weighted Blending:** Query vectors are blended with previous conversation turns. Weights are assigned as $1/n$ based on the distance from the current turn.
 *   **Whale Filtering:** Documents exceeding a calculated token threshold (based on budget and context requirements) are excluded.
-*   **Adaptive K Estimation:** The system maintains an Exponential Moving Average (EMA) of the "survival rate" (results remaining after deduplication) to adjust the number of initial candidates fetched in subsequent queries.
 
 ### 5. Storage Layout
 *   **Metadata:** SQLite stores document IDs, raw text, JSON metadata, and token counts.
