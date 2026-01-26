@@ -6,16 +6,18 @@ model_dir: D:/models/safetensors/input_models/  # HuggingFace model cache locati
 
 # Model 
 model_name: "p-e-w/Qwen3-4B-Instruct-2507-heretic"  # HF repo ID or local path
+gguf_name: ""                              # empty = HuggingFace mode  
+llama_server_url: "http://localhost:8080"  # ignored if gguf_name empty
 temperature: 0.7                        # Sampling temperature for generation
 top_p: 0.9                              # Nucleus sampling threshold
-max_new_tokens: 4096                    # Max tokens to generate per response
+max_new_tokens: 8192                   # Max tokens to generate per response
 max_length_tokens: 16384                # Truncation limit for input tokenization
 
 # HDC Encoding
 hdc_dimensions: 10000                   # Hypervector dimensionality (higher = more fidelity, more RAM)
 hdc_seed: 42                            # RNG seed for reproducible random projection matrix
 
-# .txt file chunking, only used .txt file, not for datasets
+# .txt file chunking, only used .txt/.md/.html/.xml files, not for datasets
 text_chunk_size: 1024                   # max chunk size for .txt files in dataset 
 text_chunk_overlap: 128                 # text chunk overlap for .txt file in dataset
 
@@ -29,12 +31,10 @@ batch_log_interval: 1000                 # Log progress every N batches during e
 # Retrieval
 max_context_tokens: 8192                # Token budget for retrieved context in prompt
 min_context: 6                          # include at least these many dataset items 
-hdc_search_mb: 64                       # candidates to score (L3 cache)
 
 # Database
 sqlite_max_vars: 900                    # Chunk size for IN clauses (SQLite limit ~999)
 sqlite_cache_kb: 64000                  # SQLite page cache size in KB (64MB)
-sqlite_mmap_bytes: 2147483648           # SQLite mmap size
 
 # UI
 gradio_port: 7860                       # Local port for Gradio web interface

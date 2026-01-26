@@ -1,6 +1,6 @@
 """
 hdrag - Hyperdimensional Retrieval-Augmented Generation
-Usage: >python hdrag.py --config hdrag_config.yaml [--debug]
+Usage: python hdrag.py [--config hdrag_config.yaml] [--debug]
 """
 
 from __future__ import annotations
@@ -33,46 +33,34 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
-# Module level - precompute once
-POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
-
 
 @dataclass
 class Config:
-    # Directories
     chat_history_dir: str
     hdrag_dir: str
     datasets_dir: str
     model_dir: str
-    # Model
     model_name: str
+    gguf_name: str
+    llama_server_url: str
     temperature: float
     top_p: float
     max_new_tokens: int
     max_length_tokens: int
-    # HDC Encoding
     hdc_dimensions: int
     hdc_seed: int
-    # Indexing
     batch_size: int
     vocab_chunk_multiplier: int
     hash_digest_size: int
     export_log_interval: int
     batch_log_interval: int
-    # .txt file chunking
     text_chunk_size: int
     text_chunk_overlap: int
-    # Retrieval
     max_context_tokens: int
     min_context: int
-    hdc_search_mb: int
-    # Database
     sqlite_max_vars: int
     sqlite_cache_kb: int
-    sqlite_mmap_bytes: int
-    # UI
     gradio_port: int
-    # Prompt
     system_prompt: str
 
     def save(self, path: str) -> None:
@@ -87,11 +75,11 @@ class Config:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
         valid_fields = {f.name for f in fields(cls)}
-        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
-        missing = valid_fields - set(filtered_data.keys())
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        missing = valid_fields - set(filtered.keys())
         if missing:
-            raise ValueError(f"Missing required config fields: {missing}")
-        return cls(**filtered_data)
+            raise ValueError(f"Missing config fields: {missing}")
+        return cls(**filtered)
 
 
 def chunks(xs: list, n: int) -> Generator[list, None, None]:
@@ -99,26 +87,35 @@ def chunks(xs: list, n: int) -> Generator[list, None, None]:
         yield xs[i : i + n]
 
 
-def otsu_threshold(vals: torch.Tensor) -> Optional[float]:
+def otsu_threshold(vals: torch.Tensor) -> float:
     if vals.numel() < 2:
         return None
     x, _ = torch.sort(vals)
-    median_val = torch.median(x)
-    upper = x[x >= median_val]
-    if upper.numel() < 2:
-        return median_val.item()
-    n = upper.numel()
-    sum_total = torch.sum(upper)
-    sum_left = torch.cumsum(upper, dim=0)
-    w0 = torch.arange(1, n, device=upper.device) / n
+    n = x.numel()
+    sum_total = torch.sum(x)
+    sum_left = torch.cumsum(x, dim=0)
+    w0 = torch.arange(1, n, device=x.device) / n
     w1 = 1.0 - w0
-    m0 = sum_left[:-1] / torch.arange(1, n, device=upper.device)
-    m1 = (sum_total - sum_left[:-1]) / torch.arange(n - 1, 0, -1, device=upper.device)
+    m0 = sum_left[:-1] / torch.arange(1, n, device=x.device)
+    m1 = (sum_total - sum_left[:-1]) / torch.arange(n - 1, 0, -1, device=x.device)
     scores = w0 * w1 * (m0 - m1).pow(2)
     if scores.max() == 0:
-        return median_val.item()
+        return 0.0
     max_idx = torch.argmax(scores)
-    return ((upper[max_idx] + upper[max_idx + 1]) / 2.0).item()
+    return ((x[max_idx] + x[max_idx + 1]) / 2.0).item()
+
+
+def compress_context(text: str) -> str:
+    if not text:
+        return text
+    words = text.split()
+    if not words:
+        return text
+    word_freq = Counter(words)
+    word_importance = {w: 1 / freq for w, freq in word_freq.items()}
+    threshold = statistics.median(word_importance.values())
+    compressed = [w for w in words if word_importance[w] >= threshold]
+    return " ".join(compressed)
 
 
 def discover_datasets(directory: Path) -> list:
@@ -137,25 +134,15 @@ def discover_datasets(directory: Path) -> list:
         ]:
             return [{"name": directory.stem, "path": str(directory)}]
         return datasets
-    for file_path in sorted(directory.glob("**/*")):
-        if file_path.suffix in [
-            ".json",
-            ".jsonl",
-            ".parquet",
-            ".txt",
-            ".md",
-            ".html",
-            ".xml",
-        ]:
-            datasets.append({"name": file_path.stem, "path": str(file_path)})
+    for fp in sorted(directory.glob("**/*")):
+        if fp.suffix in [".json", ".jsonl", ".parquet", ".txt", ".md", ".html", ".xml"]:
+            datasets.append({"name": fp.stem, "path": str(fp)})
     return datasets
 
 
 def iter_dataset(
     path: Path, tokenizer=None, chunk_size: int = 1024, chunk_overlap: int = 128
 ) -> Generator[dict, None, None]:
-    """Iterate over dataset, yielding documents. Handles .txt chunking."""
-
     if path.suffix in [".txt", ".md", ".html", ".xml"]:
         text = path.read_text(encoding="utf-8")
         if tokenizer and chunk_size:
@@ -172,7 +159,6 @@ def iter_dataset(
                 }
         else:
             yield {"text": text}
-
     elif path.suffix == ".parquet":
         df = pd.read_parquet(path)
         for record in df.to_dict(orient="records"):
@@ -180,13 +166,11 @@ def iter_dataset(
                 k: v.tolist() if isinstance(v, np.ndarray) else v
                 for k, v in record.items()
             }
-
     elif path.suffix == ".jsonl":
         with open(path, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     yield json.loads(line)
-
     elif path.suffix == ".json":
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -199,41 +183,34 @@ def iter_dataset(
 
 
 def extract_text(item: dict) -> str:
-    # Direct conversation array (no wrapper key)
     if (
         isinstance(item, list)
         and item
         and isinstance(item[0], dict)
         and "from" in item[0]
     ):
-        messages = [
-            msg.get("value", msg.get("content", ""))
-            for msg in item
-            if msg.get("from", msg.get("role", "")) not in ["system"]
+        msgs = [
+            m.get("value", m.get("content", ""))
+            for m in item
+            if m.get("from", m.get("role", "")) != "system"
         ]
-        return "\n\n".join(m for m in messages if m)
+        return "\n\n".join(m for m in msgs if m)
 
-    # Conversation arrays
     if "conversations" in item or "conversation" in item:
-        conv_key = "conversations" if "conversations" in item else "conversation"
-        conv = item.get(conv_key, [])
-        messages = [
-            msg.get("value", msg.get("content", ""))
-            for msg in conv
-            if msg.get("from", msg.get("role", "")) not in ["system"]
+        conv = item.get("conversations", item.get("conversation", []))
+        msgs = [
+            m.get("value", m.get("content", ""))
+            for m in conv
+            if m.get("from", m.get("role", "")) != "system"
         ]
-        return "\n\n".join(m for m in messages if m)
+        return "\n\n".join(m for m in msgs if m)
 
-    # Messages array (OpenAI format)
     if "messages" in item:
-        messages = [
-            m.get("content", "")
-            for m in item["messages"]
-            if m.get("role") not in ["system"]
+        msgs = [
+            m.get("content", "") for m in item["messages"] if m.get("role") != "system"
         ]
-        return "\n\n".join(m for m in messages if m)
+        return "\n\n".join(m for m in msgs if m)
 
-    # Top-level human/assistant pairs
     human_keys = [
         "human",
         "user",
@@ -244,7 +221,6 @@ def extract_text(item: dict) -> str:
         "message_1",
     ]
     assistant_keys = ["gpt", "assistant", "response", "answer", "output", "message_2"]
-
     parts = []
     for k in human_keys:
         if item.get(k):
@@ -255,19 +231,11 @@ def extract_text(item: dict) -> str:
             parts.append(item[k])
             break
     if parts:
-        # Also grab optional input field
         if item.get("input"):
             parts.insert(1, item["input"])
         return "\n\n".join(parts)
 
-    # Plain text fields
-    if "text" in item:
-        return item["text"]
-
-    if "content" in item:
-        return item["content"]
-
-    return ""
+    return item.get("text", item.get("content", ""))
 
 
 class CUDAManager:
@@ -325,7 +293,7 @@ class Database:
         );
         CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS idf (
-            token_id INTEGER PRIMARY KEY, 
+            token_id INTEGER PRIMARY KEY,
             doc_freq INTEGER NOT NULL,
             weight REAL NOT NULL
         ) WITHOUT ROWID;
@@ -338,12 +306,14 @@ class Database:
         self.db_path = db_path
         self.config = config
         self.corpus_hdv_file = db_path.parent / "corpus_hdc.idx"
-        self.token_hdv_file = db_path.parent / "token_hdc.idx"
-        self.vocab_index_file = db_path.parent / "vocab.idx"
         self.logger = logger
+
+        # 8-byte aligned stride for uint64 view compatibility
+        d = (config.hdc_dimensions + 7) // 8
+        self._bitmap_stride = d + (8 - d % 8) % 8
+
         self._init_db()
 
-        # SWAR constants
         self._m1 = np.uint64(0x5555555555555555)
         self._m2 = np.uint64(0x3333333333333333)
         self._m4 = np.uint64(0x0F0F0F0F0F0F0F0F)
@@ -375,7 +345,6 @@ class Database:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
         c.execute(f"PRAGMA cache_size=-{self.config.sqlite_cache_kb}")
-        c.execute(f"PRAGMA mmap_size={self.config.sqlite_mmap_bytes}")
         c.execute("PRAGMA temp_store=MEMORY")
         try:
             yield c
@@ -430,7 +399,7 @@ class Database:
 
     def get_token_counts(self) -> np.ndarray:
         n = self.count()
-        counts = np.ones(n, dtype=np.int32)  # default 1 for missing
+        counts = np.ones(n, dtype=np.int32)
         for r in self._query("SELECT hdv_idx, token_count FROM memories"):
             counts[r["hdv_idx"]] = r["token_count"] or 1
         return counts
@@ -439,25 +408,17 @@ class Database:
         if not indices or not self.corpus_hdv_file.exists():
             d = self._bytes_per_bitmap()
             return np.empty((0, d), dtype=np.uint8), np.empty((0, d), dtype=np.uint8)
-
         n = self.count()
         d = self._bytes_per_bitmap()
         hdv_data = np.memmap(self.corpus_hdv_file, dtype=np.uint8, mode="r")
         half = n * d
-
         idx = np.array(indices)
         pos_bits = hdv_data[:half].reshape(n, d)
         neg_bits = hdv_data[half:].reshape(n, d)
-
         result_pos = pos_bits[idx].copy()
         result_neg = neg_bits[idx].copy()
-
         del hdv_data
         return result_pos, result_neg
-
-    # -------------------------------------------------------------------------
-    # IDF
-    # -------------------------------------------------------------------------
 
     def save_idf(self, df_counts: dict[int, int], n_docs: int) -> None:
         idf_values = [
@@ -468,146 +429,11 @@ class Database:
             c.execute("DELETE FROM idf")
             c.executemany("INSERT INTO idf VALUES (?,?,?)", idf_values)
 
-        if idf_values:
-            self.set_config("median_idf", statistics.median(v[2] for v in idf_values))
-
     def load_idf(self) -> dict[int, float]:
         return {
             r["token_id"]: r["weight"]
             for r in self._query("SELECT token_id, weight FROM idf")
         }
-
-    def load_df(self) -> dict[int, int]:
-        return {
-            r["token_id"]: r["doc_freq"]
-            for r in self._query("SELECT token_id, doc_freq FROM idf")
-        }
-
-    # -------------------------------------------------------------------------
-    # Vocab Index (inverted index: token_id → doc_ids)
-    # -------------------------------------------------------------------------
-
-    def save_vocab_index(
-        self, vocab_index: dict[int, list[int]], vocab_size: int
-    ) -> None:
-        """Save inverted index in CSR binary format."""
-        row_ptrs = np.zeros(vocab_size + 1, dtype=np.uint64)
-        all_postings = []
-
-        for tid in range(vocab_size):
-            row_ptrs[tid + 1] = row_ptrs[tid]
-            if tid in vocab_index:
-                all_postings.extend(vocab_index[tid])
-                row_ptrs[tid + 1] += len(vocab_index[tid])
-
-        postings = (
-            np.array(all_postings, dtype=np.uint32)
-            if all_postings
-            else np.array([], dtype=np.uint32)
-        )
-
-        with open(self.vocab_index_file, "wb") as f:
-            f.write(b"VIDX")
-            f.write(np.array([1, vocab_size, len(postings)], dtype=np.uint32).tobytes())
-            f.write(row_ptrs.tobytes())
-            f.write(postings.tobytes())
-
-        if self.logger:
-            self.logger.info(
-                f"Vocab index: {len(vocab_index):,} terms, {len(postings):,} postings, "
-                f"{self.vocab_index_file.stat().st_size / 1e6:.1f}MB"
-            )
-
-    def load_vocab_index(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Load inverted index as mmap'd CSR arrays (row_ptrs, postings)."""
-        if not self.vocab_index_file.exists():
-            return None, None
-
-        with open(self.vocab_index_file, "rb") as f:
-            if f.read(4) != b"VIDX":
-                return None, None
-            _, vocab_size, n_postings = np.frombuffer(f.read(12), dtype=np.uint32)
-
-        header_bytes = 16
-        row_ptrs = np.memmap(
-            self.vocab_index_file,
-            dtype=np.uint64,
-            mode="r",
-            offset=header_bytes,
-            shape=(vocab_size + 1,),
-        )
-        postings = np.memmap(
-            self.vocab_index_file,
-            dtype=np.uint32,
-            mode="r",
-            offset=header_bytes + (vocab_size + 1) * 8,
-            shape=(n_postings,),
-        )
-        return row_ptrs, postings
-
-    # -------------------------------------------------------------------------
-    # Token HDC Index
-    # -------------------------------------------------------------------------
-
-    def save_token_hdc(self, pos: np.ndarray, neg: np.ndarray) -> None:
-        """Save token HDC index in blocked layout."""
-        n_tokens = len(pos)
-        with open(self.token_hdv_file, "wb") as f:
-            for i in range(n_tokens):
-                f.write(pos[i].tobytes())
-            for i in range(n_tokens):
-                f.write(neg[i].tobytes())
-        if self.logger:
-            self.logger.info(
-                f"Token HDC index: {n_tokens:,} tokens, "
-                f"{self.token_hdv_file.stat().st_size / 1e6:.1f}MB"
-            )
-
-    def load_token_hdc(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Load token HDC index."""
-        if not self.token_hdv_file.exists():
-            return None, None
-
-        d = self._bytes_per_bitmap()
-        data = np.memmap(self.token_hdv_file, dtype=np.uint8, mode="r")
-        n_tokens = len(data) // (d * 2)
-        half = n_tokens * d
-
-        pos = data[:half].reshape(n_tokens, d)
-        neg = data[half:].reshape(n_tokens, d)
-        return pos, neg
-
-    def expand_tokens(
-        self,
-        query_token_ids: list[int],
-        token_pos: np.ndarray,
-        token_neg: np.ndarray,
-        k: int = 5,
-    ) -> list[int]:
-        """Expand query tokens using HDC similarity over vocab."""
-        expanded = set(query_token_ids)
-
-        t_pos_64 = token_pos.view(np.uint64)
-        t_neg_64 = token_neg.view(np.uint64)
-        n_tokens = len(t_pos_64)
-
-        for tid in query_token_ids:
-            if tid >= n_tokens:
-                continue
-
-            scores = self._score_bitmap_64(
-                t_pos_64, t_neg_64, t_pos_64[tid], t_neg_64[tid]
-            )
-            scores[tid] = -np.inf  # exclude self
-
-            topk = np.argpartition(scores, -k)[-k:]
-            expanded.update(topk.tolist())
-
-        return list(expanded)
-
-    # -------------------------------------------------------------------------
-    # Config
-    # -------------------------------------------------------------------------
 
     def get_config(self, key: str) -> Optional[Any]:
         rows = self._query("SELECT value FROM config WHERE key=?", (key,))
@@ -623,10 +449,6 @@ class Database:
             c.execute(
                 "INSERT OR REPLACE INTO config VALUES (?,?)", (key, json.dumps(value))
             )
-
-    # -------------------------------------------------------------------------
-    # Insert / Finalize
-    # -------------------------------------------------------------------------
 
     def insert(self, items: list[dict], bitmaps: dict[str, np.ndarray]) -> None:
         pos, neg = bitmaps["pos"], bitmaps["neg"]
@@ -653,19 +475,15 @@ class Database:
                 f.write(neg[i].tobytes())
 
     def finalize_index(self) -> None:
-        """Reorganize corpus HDC to blocked layout (all pos, then all neg)."""
         n = self.count()
         if n == 0:
             return
         d = self._bytes_per_bitmap()
         expected = n * d * 2
-        if not self.corpus_hdv_file.exists():
-            return
-        if self.corpus_hdv_file.stat().st_size != expected:
-            if self.logger:
-                self.logger.warning(
-                    f"Index file size mismatch: {self.corpus_hdv_file.stat().st_size} vs {expected}"
-                )
+        if (
+            not self.corpus_hdv_file.exists()
+            or self.corpus_hdv_file.stat().st_size != expected
+        ):
             return
         if self.logger:
             self.logger.info(f"Reorganizing {n:,} HDVs to blocked layout")
@@ -680,100 +498,72 @@ class Database:
                 dst.write(src.read(d))
         temp_file.replace(self.corpus_hdv_file)
 
-        if self.logger:
-            self.logger.info(
-                f"Index complete: {self.corpus_hdv_file.stat().st_size / 1e9:.2f} GB"
-            )
-
-    # -------------------------------------------------------------------------
-    # Search
-    # -------------------------------------------------------------------------
-
     def search(
         self,
         q_pos: np.ndarray,
         q_neg: np.ndarray,
-        candidate_indices: list[int],
-        k: int,
-    ) -> tuple[list[int], list[float]]:
-        """Score candidate documents against query (no coarse pass)."""
-        if not self.corpus_hdv_file.exists() or not candidate_indices:
-            return [], []
-
-        n = self.count()
-        if n == 0:
-            return [], []
-
-        d = self._bytes_per_bitmap()
-        hdv_data = np.memmap(self.corpus_hdv_file, dtype=np.uint8, mode="r")
-
-        half = n * d
-        pos_bits = hdv_data[:half].reshape(n, d)
-        neg_bits = hdv_data[half:].reshape(n, d)
-
-        q_pos_64 = q_pos.ravel().view(np.uint64)
-        q_neg_64 = q_neg.ravel().view(np.uint64)
-
-        # Score only candidates (already cache-sized by caller)
-        cand_idx = np.array(candidate_indices)
-        d_pos_64 = pos_bits[cand_idx].view(np.uint64)
-        d_neg_64 = neg_bits[cand_idx].view(np.uint64)
-
-        scores = self._score_bitmap_64(d_pos_64, d_neg_64, q_pos_64, q_neg_64)
-
-        # Top k
-        top_k = min(k, len(scores))
-        if top_k == 0:
-            del hdv_data
-            return [], []
-
-        top_pos = np.argpartition(scores, -top_k)[-top_k:]
-        top_pos = top_pos[np.argsort(scores[top_pos])[::-1]]
-
-        result_indices = cand_idx[top_pos].tolist()
-        result_scores = scores[top_pos].tolist()
-
-        del hdv_data
-        return result_indices, result_scores
-
-    def search_full(
-        self, q_pos: np.ndarray, q_neg: np.ndarray, k: int
-    ) -> tuple[list[int], list[float]]:
-        """Fallback: score all documents (for queries with no vocab matches)."""
+        target: int,
+        candidates: np.ndarray = None,
+        logger=None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if not self.corpus_hdv_file.exists():
-            return [], []
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
 
         n = self.count()
         if n == 0:
-            return [], []
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
 
-        d = self._bytes_per_bitmap()
+        corpus_idx = candidates if candidates is not None else np.arange(n)
+        n_candidates = len(corpus_idx)
+
+        if n_candidates == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+
+        n_passes = (
+            max(2, int(np.ceil(np.log2(n_candidates / target))))
+            if n_candidates > target
+            else 1
+        )
+
+        if logger:
+            logger.info(f"[Prune] n={n_candidates:,} target={target} passes={n_passes}")
+
         hdv_data = np.memmap(self.corpus_hdv_file, dtype=np.uint8, mode="r")
-
-        half = n * d
-        pos_bits = hdv_data[:half].reshape(n, d)
-        neg_bits = hdv_data[half:].reshape(n, d)
-
+        half = n * self._bitmap_stride
+        pos_bits = hdv_data[:half].reshape(n, self._bitmap_stride)
+        neg_bits = hdv_data[half:].reshape(n, self._bitmap_stride)
+        pos_64 = pos_bits.view(np.uint64)
+        neg_64 = neg_bits.view(np.uint64)
         q_pos_64 = q_pos.ravel().view(np.uint64)
         q_neg_64 = q_neg.ravel().view(np.uint64)
-        d_pos_64 = pos_bits.view(np.uint64)
-        d_neg_64 = neg_bits.view(np.uint64)
+        n_cols = pos_64.shape[1]
+        chunk_size = max(1, n_cols // n_passes)
+        cumulative = np.zeros(n_candidates, dtype=np.float32)
+        survivors = np.arange(n_candidates)
 
-        scores = self._score_bitmap_64(d_pos_64, d_neg_64, q_pos_64, q_neg_64)
+        for i in range(n_passes):
+            start = i * chunk_size
+            end = n_cols if i == n_passes - 1 else start + chunk_size
+            corpus_survivors = corpus_idx[survivors]
+            cumulative[survivors] += self._score_bitmap_64(
+                pos_64[corpus_survivors, start:end],
+                neg_64[corpus_survivors, start:end],
+                q_pos_64[start:end],
+                q_neg_64[start:end],
+            )
 
-        top_k = min(k, len(scores))
-        top_pos = np.argpartition(scores, -top_k)[-top_k:]
-        top_pos = top_pos[np.argsort(scores[top_pos])[::-1]]
+            if i < n_passes - 1 and len(survivors) > 1:
+                keep = max(1, len(survivors) // 2)
+                idx = np.argpartition(cumulative[survivors], -keep)[-keep:]
+                survivors = survivors[idx]
 
-        result_indices = top_pos.tolist()
-        result_scores = scores[top_pos].tolist()
+        if logger:
+            logger.info(f"[Prune] {n_candidates:,}→{len(survivors):,} survivors")
 
+        scores = cumulative[survivors]
+        order = np.argsort(-scores)
         del hdv_data
-        return result_indices, result_scores
-
-    # -------------------------------------------------------------------------
-    # Scoring
-    # -------------------------------------------------------------------------
+        return corpus_idx[survivors[order]], scores[order]
 
     def _score_bitmap_64(
         self,
@@ -785,10 +575,8 @@ class Database:
         if q_pos_64.ndim == 1:
             q_pos_64 = q_pos_64[None, :]
             q_neg_64 = q_neg_64[None, :]
-
         agree = (d_pos_64 & q_pos_64) | (d_neg_64 & q_neg_64)
         disagree = (d_pos_64 & q_neg_64) | (d_neg_64 & q_pos_64)
-
         return (
             self._popcount64(agree).sum(axis=1) - self._popcount64(disagree).sum(axis=1)
         ).astype(np.float32)
@@ -799,10 +587,6 @@ class Database:
         x = (x + (x >> 4)) & self._m4
         return ((x * self._h01) >> 56).astype(np.int32)
 
-    # -------------------------------------------------------------------------
-    # Clear / Stats
-    # -------------------------------------------------------------------------
-
     def clear(self) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM memories")
@@ -810,10 +594,6 @@ class Database:
             c.execute("DELETE FROM config WHERE key != 'hdc_dimensions'")
         if self.corpus_hdv_file.exists():
             self.corpus_hdv_file.unlink()
-        if self.token_hdv_file.exists():
-            self.token_hdv_file.unlink()
-        if self.vocab_index_file.exists():
-            self.vocab_index_file.unlink()
 
     def stats(self) -> dict:
         return {
@@ -821,30 +601,17 @@ class Database:
             "corpus_hdv_mb": self.corpus_hdv_file.stat().st_size / 1e6
             if self.corpus_hdv_file.exists()
             else 0,
-            "token_hdv_mb": self.token_hdv_file.stat().st_size / 1e6
-            if self.token_hdv_file.exists()
-            else 0,
-            "vocab_index_mb": self.vocab_index_file.stat().st_size / 1e6
-            if self.vocab_index_file.exists()
-            else 0,
         }
 
     def source_counts(self) -> dict:
-        rows = self._query("""
-            SELECT json_extract(metadata, '$.source') as src, COUNT(*) as n
-            FROM memories GROUP BY src ORDER BY n DESC
-        """)
+        rows = self._query(
+            "SELECT json_extract(metadata, '$.source') as src, COUNT(*) as n FROM memories GROUP BY src ORDER BY n DESC"
+        )
         return {r["src"]: r["n"] for r in rows}
 
-    # -------------------------------------------------------------------------
-    # Analysis
-    # -------------------------------------------------------------------------
-
     def compute_sparsity(self) -> dict:
-        """Compute ternary distribution across all corpus HDVs."""
         if not self.corpus_hdv_file.exists():
             return {"positive": 0, "negative": 0, "zero": 1}
-
         n = self.count()
         if n == 0:
             return {"positive": 0, "negative": 0, "zero": 1}
@@ -863,17 +630,14 @@ class Database:
         neg_count = neg_unpacked.sum()
         zero_count = total - (pos_unpacked | neg_unpacked).sum()
 
-        result = {
+        del hdv_data
+        return {
             "positive": float(pos_count / total),
             "negative": float(neg_count / total),
             "zero": float(zero_count / total),
         }
 
-        del hdv_data
-        return result
-
     def sample_similarities(self, n_samples: int = 5000) -> list[float]:
-        """Sample pairwise similarities for corpus diversity analysis."""
         n = self.count()
         if not self.corpus_hdv_file.exists() or n < 2:
             return []
@@ -892,24 +656,16 @@ class Database:
         mask = idx_a != idx_b
         idx_a, idx_b = idx_a[mask][:n_samples], idx_b[mask][:n_samples]
 
-        scores = []
-        for a, b in zip(idx_a, idx_b):
-            score = self._score_bitmap_64(
-                d_pos_64[a : a + 1],
-                d_neg_64[a : a + 1],
-                d_pos_64[b],
-                d_neg_64[b],
-            )[0]
-            scores.append(float(score))
+        scores = self._score_bitmap_64(
+            d_pos_64[idx_a], d_neg_64[idx_a], d_pos_64[idx_b], d_neg_64[idx_b]
+        )
 
         del hdv_data
-        return scores
+        return scores.tolist()
 
     def dimension_activation(self) -> tuple[np.ndarray, np.ndarray]:
-        """Compute dimension activation frequencies."""
         if not self.corpus_hdv_file.exists():
             return np.array([]), np.array([])
-
         n = self.count()
         if n == 0:
             return np.array([]), np.array([])
@@ -926,16 +682,11 @@ class Database:
         pos_freq = pos_unpacked.mean(axis=0)
         neg_freq = neg_unpacked.mean(axis=0)
 
-        corr = np.corrcoef(pos_freq, neg_freq)[0, 1]
-        if self.logger:
-            self.logger.debug(f"Pos/Neg frequency correlation: {corr:.3f}")
-
         del hdv_data
         return pos_freq, neg_freq
 
     def close(self) -> None:
-        """Close database connections."""
-        pass  # Nothing to close with ephemeral mmaps
+        pass
 
 
 class HDCEncoder:
@@ -989,7 +740,6 @@ class HDCEncoder:
         pos_packed = np.packbits(pos, axis=1)
         neg_packed = np.packbits(neg, axis=1)
 
-        # Pad to uint64 alignment
         target = self._bytes_per_bitmap()
         pad = target - pos_packed.shape[1]
         if pad:
@@ -1007,59 +757,34 @@ class HDCEncoder:
 class Deduplicator:
     def __init__(self, config: Config):
         self.config = config
-        self._popcount_table = np.array(
-            [bin(i).count("1") for i in range(256)], dtype=np.int32
-        )
-
-    def _normalize(self, text: str) -> str:
-        return " ".join(text.lower().split())
 
     def dedup(
         self,
         results: list[dict],
         bitmaps: Optional[tuple[np.ndarray, np.ndarray]] = None,
         scores: Optional[np.ndarray] = None,
+        logger=None,
     ) -> tuple[list[dict], Optional[tuple[np.ndarray, np.ndarray]]]:
         n = len(results)
         if n <= 1:
             return results, bitmaps
 
         keep = np.ones(n, dtype=bool)
+        token_sets = [set(r["memory"]["text"].lower().split()) for r in results]
 
-        # Stage 0: Otsu filter on retrieval scores
-        if scores is not None and len(scores) > 1:
-            threshold = otsu_threshold(torch.from_numpy(scores))
-            if threshold is not None:
-                keep &= scores >= threshold
-                if keep.sum() <= 1:
-                    return self._apply_mask(results, bitmaps, keep)
-
-        texts = [r["memory"]["text"] for r in results]
-        normalized = [self._normalize(t) for t in texts]
-        token_sets = [set(t.split()) for t in normalized]
-
-        keep &= self._exact_dedup(normalized)
+        pre = keep.sum()
+        keep &= self._token_subset_dedup(token_sets, keep)
+        if logger and keep.sum() < pre:
+            logger.info(f"[Dedup] subset: {pre}→{keep.sum()}")
         if keep.sum() <= 1:
             return self._apply_mask(results, bitmaps, keep)
 
-        if keep.sum() > 1:
-            keep &= self._token_subset_dedup(token_sets, keep)
-            if keep.sum() <= 1:
-                return self._apply_mask(results, bitmaps, keep)
-
-        if bitmaps is not None and keep.sum() > 2:
-            keep &= self._near_dedup(bitmaps, keep)
+        pre = keep.sum()
+        keep &= self._near_dedup(token_sets, keep)
+        if logger and keep.sum() < pre:
+            logger.info(f"[Dedup] near: {pre}→{keep.sum()}")
 
         return self._apply_mask(results, bitmaps, keep)
-
-    def _exact_dedup(self, normalized: list[str]) -> np.ndarray:
-        seen = set()
-        keep = np.zeros(len(normalized), dtype=bool)
-        for i, text in enumerate(normalized):
-            if text not in seen:
-                seen.add(text)
-                keep[i] = True
-        return keep
 
     def _token_subset_dedup(
         self, token_sets: list[set[str]], keep: np.ndarray
@@ -1080,59 +805,38 @@ class Deduplicator:
                     mask[indices[j]] = False
         return mask
 
-    def _near_dedup(
-        self,
-        bitmaps: tuple[np.ndarray, np.ndarray],
-        keep: np.ndarray,
-        threshold: float = 0.9,
-    ) -> np.ndarray:
-        """Near-duplicate detection. Vectorized upper-triangle with early exit."""
-        indices = np.where(keep)[0]
+    def _near_dedup(self, token_sets: list[set[str]], keep: np.ndarray) -> np.ndarray:
+        indices = np.where(keep)[0].tolist()
         n = len(indices)
         if n <= 1:
             return keep
 
-        pos, neg = bitmaps
-        pos_active = pos[indices]
-        neg_active = neg[indices]
+        pair_jaccards = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                set_i, set_j = token_sets[indices[i]], token_sets[indices[j]]
+                union = len(set_i | set_j)
+                if union > 0:
+                    pair_jaccards.append(len(set_i & set_j) / union)
 
-        # Self-similarity for normalization
-        self_sims = (
-            self._popcount_table[pos_active].sum(axis=1)
-            + self._popcount_table[neg_active].sum(axis=1)
-        ).astype(np.float32)
-        self_sims[self_sims == 0] = 1
+        if not pair_jaccards:
+            return keep
 
-        alive = np.ones(n, dtype=bool)
+        threshold = otsu_threshold(torch.tensor(pair_jaccards, dtype=torch.float32))
+        if threshold == 0.0:
+            return keep
 
-        for i in range(n - 1):
-            if not alive[i]:
+        mask = np.ones(len(token_sets), dtype=bool)
+        for i in range(n):
+            if not mask[indices[i]]:
                 continue
-
-            # Candidates: j > i and still alive
-            candidates = np.where(alive[i + 1 :])[0] + (i + 1)
-            if len(candidates) == 0:
-                continue
-
-            # Vectorized similarity: doc i vs all candidates
-            pi, ni = pos_active[i], neg_active[i]
-            pj, nj = pos_active[candidates], neg_active[candidates]
-
-            agree = self._popcount_table[pj & pi].sum(axis=1) + self._popcount_table[
-                nj & ni
-            ].sum(axis=1)
-            disagree = self._popcount_table[pj & ni].sum(axis=1) + self._popcount_table[
-                nj & pi
-            ].sum(axis=1)
-
-            sims = (agree - disagree) / np.sqrt(self_sims[i] * self_sims[candidates])
-
-            # Mark duplicates
-            alive[candidates[sims > threshold]] = False
-
-        # Map back to original space
-        mask = np.ones(len(pos), dtype=bool)
-        mask[indices[~alive]] = False
+            for j in range(i + 1, n):
+                if not mask[indices[j]]:
+                    continue
+                set_i, set_j = token_sets[indices[i]], token_sets[indices[j]]
+                union = len(set_i | set_j)
+                if union > 0 and len(set_i & set_j) / union > threshold:
+                    mask[indices[j]] = False
         return mask
 
     def _apply_mask(
@@ -1141,22 +845,25 @@ class Deduplicator:
         bitmaps: Optional[tuple[np.ndarray, np.ndarray]],
         mask: np.ndarray,
     ) -> tuple[list[dict], Optional[tuple[np.ndarray, np.ndarray]]]:
-        filtered_results = [r for i, r in enumerate(results) if mask[i]]
+        filtered = [r for i, r in enumerate(results) if mask[i]]
         if bitmaps is not None:
             pos, neg = bitmaps
-            filtered_bitmaps = (pos[mask], neg[mask])
-        else:
-            filtered_bitmaps = None
-        return filtered_results, filtered_bitmaps
+            return filtered, (pos[mask], neg[mask])
+        return filtered, None
 
 
 class Retriever:
+    """
+    Progressive pruning HDC retriever.
+    Pipeline: HDC encode → score all (chunked + prune) → Otsu → dedup → rerank → budget fill
+    """
+
     def __init__(
         self,
         db: Database,
         hdc: HDCEncoder,
         dedup: Deduplicator,
-        model: ModelManager,
+        model,
         config: Config,
         logger: logging.Logger,
     ):
@@ -1167,55 +874,7 @@ class Retriever:
         self.config = config
         self.logger = logger
         self._turns: list[torch.Tensor] = []
-        self._token_pos, self._token_neg = db.load_token_hdc()
-        self._vocab_row_ptrs, self._vocab_postings = db.load_vocab_index()
-        self._idf = self.db.load_idf()
-        self._median_idf = self.db.get_config("median_idf") or 0
         self._token_counts = self.db.get_token_counts()
-
-    def _max_candidates(self) -> int:
-        """Max docs to score - sized to cache budget."""
-        bytes_per_doc = 2 * self.db._bytes_per_bitmap()
-        budget_bytes = self.config.hdc_search_mb * 1024 * 1024
-        return int(budget_bytes * 0.9 / bytes_per_doc)
-
-    def _get_vocab_candidates(
-        self, query_tokens: list[int], idf: dict[int, float]
-    ) -> list[int]:
-        """Get candidate doc indices from vocab index, weighted by IDF."""
-        if self._vocab_row_ptrs is None:
-            return []
-
-        row_ptrs, postings = self._vocab_row_ptrs, self._vocab_postings
-        vocab_size = len(row_ptrs) - 1
-
-        chunks, weights = [], []
-        for tid in query_tokens:
-            if tid >= vocab_size:
-                continue
-            start, end = row_ptrs[tid], row_ptrs[tid + 1]
-            if start < end:
-                chunks.append(postings[start:end])
-                weights.append(
-                    np.full(end - start, idf.get(tid, 1.0), dtype=np.float32)
-                )
-
-        if not chunks:
-            return []
-
-        hdv_ids = np.concatenate(chunks)
-        scores = np.bincount(
-            hdv_ids, weights=np.concatenate(weights), minlength=self.db.count()
-        )
-
-        max_cand = self._max_candidates()
-        nz = np.count_nonzero(scores)
-        if nz == 0:
-            return []
-
-        k = min(max_cand, nz)
-        top = np.argpartition(scores, -k)[-k:]
-        return top[np.argsort(scores[top])[::-1]].tolist()
 
     def add_turn(self, text: str) -> None:
         emb = self.model.extract_embeddings([text]).squeeze(0).cpu()
@@ -1229,30 +888,11 @@ class Retriever:
         all_embs = self._turns + [q]
         if len(all_embs) == 1:
             return q.unsqueeze(0)
-
         weights = torch.tensor(
             [1.0 / (len(all_embs) - i) for i in range(len(all_embs))]
         )
         blended = (torch.stack(all_embs) * weights.unsqueeze(-1)).sum(0)
         return F.normalize(blended.unsqueeze(0), p=2, dim=1)
-
-    def release_indices(self) -> None:
-        import gc
-
-        # Explicitly delete memmaps to release file handles (required on Windows)
-        if self._token_pos is not None:
-            del self._token_pos
-        if self._token_neg is not None:
-            del self._token_neg
-        if self._vocab_row_ptrs is not None:
-            del self._vocab_row_ptrs
-        if self._vocab_postings is not None:
-            del self._vocab_postings
-        self._token_pos = None
-        self._token_neg = None
-        self._vocab_row_ptrs = None
-        self._vocab_postings = None
-        gc.collect()
 
     def search(
         self,
@@ -1264,18 +904,7 @@ class Retriever:
         if self.db.count() == 0:
             return []
 
-        self.logger.info(f"[Search] {len(query)}: Length query")
-
-        query_tokens = self.model.tokenizer.encode(query, add_special_tokens=False)
-        candidates = self._get_vocab_candidates(query_tokens, self.hdc.idf)
-
-        max_doc_size = token_budget / self.config.min_context
-        candidates = [c for c in candidates if self._token_counts[c] <= max_doc_size]
-
-        self.logger.info(f"[Search] {len(candidates):,} candidates")
-
-        if not candidates:
-            return []
+        self.logger.info(f"[Search] Query: {len(query)} chars")
 
         query_emb = self.model.extract_embeddings([query])
         if track:
@@ -1285,56 +914,70 @@ class Retriever:
             search_emb = query_emb
 
         bitmaps = self.hdc.encode(search_emb)
+
+        # Derive target from retrieval semantics: enough candidates to fill budget min_context times
+        max_doc_size = token_budget // self.config.min_context
+        median_tokens = max(1, self.hdc.median_doc_length)
+        target = token_budget // median_tokens * self.config.min_context
+        eligible = np.where(self._token_counts <= max_doc_size)[0]
+
         indices, scores = self.db.search(
-            bitmaps["pos"], bitmaps["neg"], candidates, len(candidates)
+            bitmaps["pos"],
+            bitmaps["neg"],
+            target,
+            candidates=eligible,
+            logger=self.logger,
         )
 
-        if not indices:
+        score_threshold = otsu_threshold(torch.from_numpy(scores))
+        pre_otsu = len(indices)
+
+        if score_threshold != 0.0:
+            mask = scores >= score_threshold
+            indices, scores = indices[mask], scores[mask]
+
+        self.logger.info(
+            f"[Search] {len(eligible):,}→{pre_otsu}→{len(indices)} (prune→Otsu)"
+            + (f" threshold={score_threshold:.1f}" if score_threshold != 0.0 else "")
+        )
+
+        if len(indices) == 0:
             return []
 
-        ranked = sorted(
-            [(i, s, self._token_counts[i]) for i, s in zip(indices, scores)],
-            key=lambda x: x[1],
-            reverse=True,
-        )
-
-        # Token-budget-aware cap: keep enough to survive dedup
-        dedup_budget = token_budget * 10
-        cumulative, cutoff = 0, len(ranked)
-        for idx, (_, _, tc) in enumerate(ranked):
-            cumulative += tc
-            if cumulative >= dedup_budget:
-                cutoff = idx + 1
-                break
-        ranked = ranked[:cutoff]
-
-        sel_idx = [r[0] for r in ranked]
-        score_map = {r[0]: r[1] for r in ranked}
+        sel_idx = indices.tolist()
+        score_map = {i: s for i, s in zip(sel_idx, scores.tolist())}
         memories = self.db.get_memories(sel_idx)
 
-        # Filter by enabled sources
         if enabled_sources:
             memories = {
-                idx: mem
-                for idx, mem in memories.items()
-                if mem.get("metadata", {}).get("source") in enabled_sources
+                i: m
+                for i, m in memories.items()
+                if m.get("metadata", {}).get("source") in enabled_sources
             }
             sel_idx = [i for i in sel_idx if i in memories]
 
         if len(sel_idx) > 1:
-            temp, temp_scores = [], []
-            for i in sel_idx:
-                if i in memories:
-                    temp.append({"memory": memories[i], "hdv_idx": i})
-                    temp_scores.append(score_map[i])
-
-            bitmaps = self.db.get_bitmaps(sel_idx)
-            scores_arr = np.array(temp_scores, dtype=np.float32)
-            deduped, _ = self.dedup.dedup(temp, bitmaps, scores_arr)
+            temp = [
+                {"memory": memories[i], "hdv_idx": i} for i in sel_idx if i in memories
+            ]
+            temp_scores = np.array(
+                [score_map[i] for i in sel_idx if i in memories], dtype=np.float32
+            )
+            bitmaps = self.db.get_bitmaps([t["hdv_idx"] for t in temp])
+            deduped, _ = self.dedup.dedup(temp, bitmaps, temp_scores, self.logger)
         else:
             deduped = [
                 {"memory": memories[i], "hdv_idx": i} for i in sel_idx if i in memories
             ]
+
+        deduped_tokens = sum(r["memory"].get("token_count", 0) for r in deduped)
+        if len(deduped) > 1 and deduped_tokens > token_budget:
+            texts = [r["memory"]["text"] for r in deduped]
+            doc_embs = self.model.extract_embeddings(texts, use_idf=False)
+            q_emb = self.model.extract_embeddings([query], use_idf=False)
+            sims = (q_emb @ doc_embs.T).squeeze(0)
+            order = torch.argsort(sims, descending=True).tolist()
+            deduped = [deduped[i] for i in order]
 
         results, final_tokens = [], 0
         for r in deduped:
@@ -1349,9 +992,8 @@ class Retriever:
                 final_tokens += tc
 
         self.logger.info(
-            f"[Search] {len(ranked)}→{len(deduped)}→{len(results)} ({final_tokens:,} tokens)"
+            f"[Search] {len(sel_idx)}→{len(deduped)}→{len(results)} ({final_tokens:,} tokens)"
         )
-
         return results
 
 
@@ -1409,6 +1051,17 @@ class ModelManager:
 
     def load_full_model(self) -> None:
         model_path = self._download_model(self.config.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        if self.config.gguf_name:
+            self.logger.info(
+                f"GGUF mode: using llama.cpp server at {self.config.llama_server_url}"
+            )
+            if CUDA.get("embedding_table") is None:
+                self.load_embedding_table()
+            self.model = None
+            return
+
         self.logger.info(f"Loading model from {model_path}")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -1417,7 +1070,6 @@ class ModelManager:
             trust_remote_code=True,
             device_map="auto",
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         embedding_table = self.model.get_input_embeddings().weight.data.clone()
         CUDA.register("embedding_table", embedding_table)
 
@@ -1431,7 +1083,9 @@ class ModelManager:
             idf_weights[tid] = 0.0
         self.idf_weights = CUDA.register("idf_weights", idf_weights)
 
-    def extract_embeddings(self, texts: list[str]) -> torch.Tensor:
+    def extract_embeddings(
+        self, texts: list[str], use_idf: bool = True
+    ) -> torch.Tensor:
         inputs = self.tokenizer(
             texts,
             padding=True,
@@ -1451,16 +1105,61 @@ class ModelManager:
         embeddings = embedding_table[input_ids_gpu]
         mask = attn_gpu.unsqueeze(-1).float()
 
-        if idf_weights is not None:
+        if use_idf and idf_weights is not None:
             weights = idf_weights[input_ids_gpu]
+            w_expanded = weights.unsqueeze(-1) * mask
+            pooled = (embeddings * w_expanded).sum(1) / w_expanded.sum(1).clamp(1e-9)
         else:
-            weights = torch.ones_like(attn_gpu, dtype=torch.float32)
+            pooled = (embeddings * mask).sum(1) / mask.sum(1).clamp(1e-9)
 
-        w_expanded = weights.unsqueeze(-1) * mask
-        pooled = (embeddings * w_expanded).sum(1) / w_expanded.sum(1).clamp(1e-9)
         return F.normalize(pooled, p=2, dim=1).cpu()
 
+    def _generate_via_server(self, prompt: str):
+        import requests
+
+        payload = {
+            "prompt": prompt,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "n_predict": self.config.max_new_tokens,
+            "stream": True,
+        }
+
+        try:
+            with requests.post(
+                f"{self.config.llama_server_url}/completion",
+                json=payload,
+                stream=True,
+                timeout=(5, None),
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    line = line.decode("utf-8")
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        if content := chunk.get("content", ""):
+                            yield content
+                    except json.JSONDecodeError:
+                        continue
+        except requests.exceptions.ConnectionError:
+            yield f"\n\n[Error: Cannot connect to llama.cpp server at {self.config.llama_server_url}]"
+        except requests.exceptions.Timeout:
+            yield "\n\n[Error: Connection timeout]"
+        except requests.exceptions.RequestException as e:
+            yield f"\n\n[Error: {e}]"
+
     def generate_stream(self, prompt: str):
+        if self.model is None:
+            yield from self._generate_via_server(prompt)
+            return
+
         device = next(self.model.parameters()).device
         inputs = self.tokenizer([prompt], return_tensors="pt").to(device)
         streamer = TextIteratorStreamer(
@@ -1520,9 +1219,7 @@ class HdRAG:
         )
         self.chat_log = ConversationLogger(self.config.chat_history_dir)
 
-        # Dataset filtering - all sources enabled by default
         self.enabled_sources: set = set(self.db.source_counts().keys())
-
         self.logger.info(f"HdRAG initialized with {self.db.count():,} memories")
 
     def _setup_logging(self, debug: bool) -> logging.Logger:
@@ -1538,9 +1235,6 @@ class HdRAG:
         self.model.load_full_model()
         if self.hdc.idf:
             self.model.set_idf_weights(self.hdc.idf)
-
-        # Load token HDC for query expansion
-        self._token_pos, self._token_neg = self.db.load_token_hdc()
 
     def new_conversation(self) -> None:
         self.chat_log.new_conversation()
@@ -1562,83 +1256,10 @@ class HdRAG:
         results = self.search(query, token_budget, track)
         return "\n\n---\n\n".join(r["memory"]["text"] for r in results)
 
-    def compress_expand_context(
-        self, query: str, token_budget: int = None, track: bool = True
-    ) -> str:
-        """
-        Get context with compression:
-        1. Retrieve context normally
-        2. Extract unique tokens preserving order
-        3. Remove tokens with IDF < median(IDF of context tokens)
-        4. Return unique high-IDF tokens in original relative order
-        """
-        import time
-
-        # Get normal context first
-        context = self.get_context(query, token_budget, track)
-        if not context:
-            return ""
-
-        # Tokenize
-        tokens = self.model.tokenizer.encode(context, add_special_tokens=False)
-        if not tokens:
-            return ""
-
-        # Get unique tokens preserving order
-        seen = set()
-        unique_tokens = []
-        for t in tokens:
-            if t not in seen:
-                seen.add(t)
-                unique_tokens.append(t)
-
-        # Get IDF data
-        idf = self.hdc.idf
-        if not idf:
-            return context
-
-        # Calculate LOCAL median IDF from the retrieved context tokens
-        context_idfs = [idf.get(t, 0) for t in unique_tokens if idf.get(t, 0) > 0]
-        if not context_idfs:
-            return context
-        local_median_idf = float(np.median(context_idfs))
-        if local_median_idf <= 0:
-            return context
-
-        self.logger.info(
-            f"[Compress] Raw context: {len(context)} chars, "
-            f"{len(tokens)} tokens, {len(unique_tokens)} unique, median IDF: {local_median_idf:.3f}"
-        )
-
-        # Filter to high-IDF tokens (IDF >= local median)
-        high_idf_tokens = [
-            t for t in unique_tokens if idf.get(t, 0) >= local_median_idf
-        ]
-        if not high_idf_tokens:
-            return context
-
-        self.logger.info(
-            f"[Compress] Filtered to {len(high_idf_tokens)} high-IDF tokens"
-        )
-
-        # Decode back to text
-        compressed = self.model.tokenizer.decode(
-            high_idf_tokens, skip_special_tokens=True
-        )
-        return compressed
-
     def add_turn(self, text: str) -> None:
         self.retriever.add_turn(text)
 
     def clear_index(self) -> None:
-        self.retriever.release_indices()
-        # Also release HdRAG's own memmap references
-        if hasattr(self, "_token_pos") and self._token_pos is not None:
-            del self._token_pos
-            self._token_pos = None
-        if hasattr(self, "_token_neg") and self._token_neg is not None:
-            del self._token_neg
-            self._token_neg = None
         import gc
 
         gc.collect()
@@ -1666,16 +1287,7 @@ class HdRAG:
         if not files:
             return 0
 
-        # Release mmap handles before clearing (required on Windows)
         self.logger.info("Clearing existing index...")
-        self.retriever.release_indices()
-        # Also release HdRAG's own memmap references
-        if hasattr(self, "_token_pos") and self._token_pos is not None:
-            del self._token_pos
-            self._token_pos = None
-        if hasattr(self, "_token_neg") and self._token_neg is not None:
-            del self._token_neg
-            self._token_neg = None
         import gc
 
         gc.collect()
@@ -1683,7 +1295,6 @@ class HdRAG:
             self.db.corpus_hdv_file.unlink()
         self.db.clear()
 
-        # Pass 1: Build vocabulary
         self.logger.info("Pass 1: Building vocabulary...")
         special = set(self.model.tokenizer.all_special_ids)
         chunk_size = self.config.batch_size * self.config.vocab_chunk_multiplier
@@ -1724,15 +1335,11 @@ class HdRAG:
             if progress_cb:
                 progress_cb((i + 1) / len(files) * 0.3, f"Pass 1: {name}")
 
-        # Dedupe
         seen, unique = set(), []
         for d in docs:
             if d["id"] not in seen:
                 seen.add(d["id"])
                 unique.append(d)
-
-        if len(unique) < len(docs):
-            self.logger.info(f"Removed {len(docs) - len(unique):,} duplicates")
         docs = unique
 
         if not docs:
@@ -1742,13 +1349,11 @@ class HdRAG:
         self.logger.info(f"Full rebuild: {len(docs):,} documents")
         self.db.set_config("hdc_seed", self.config.hdc_seed)
 
-        # Compute IDF
         self.logger.info("Computing IDF...")
         n_docs = len(docs)
         idf = {tid: math.log((n_docs + 1) / (df + 1)) for tid, df in vocab_df.items()}
         self.db.save_idf(dict(vocab_df), n_docs)
 
-        self.logger.info(f"Vocabulary: {len(idf):,} terms")
         self.db.set_config(
             "median_doc_length", statistics.median(d["token_count"] for d in docs)
         )
@@ -1756,13 +1361,6 @@ class HdRAG:
         self.hdc.median_doc_length = self.db.get_config("median_doc_length")
         self.model.set_idf_weights(idf)
 
-        # Build token HDC index
-        self.logger.info("Building token HDC index...")
-        emb_table = CUDA.get("embedding_table")
-        token_bitmaps = self.hdc.encode(emb_table)
-        self.db.save_token_hdc(token_bitmaps["pos"], token_bitmaps["neg"])
-
-        # Pass 2: Encode
         self.logger.info("Pass 2: Encoding...")
         bs = self.config.batch_size
         n_batches = (len(docs) + bs - 1) // bs
@@ -1792,30 +1390,11 @@ class HdRAG:
             if progress_cb:
                 progress_cb(0.3 + (i + 1) / n_batches * 0.7, f"Pass 2: batch {i + 1}")
 
-        # Build vocab index (token_id → list of hdv_idx)
-        self.logger.info("Building vocab index...")
-        vocab_index: dict[int, list[int]] = {}
-        for hdv_idx, doc in enumerate(docs):
-            for token_id in doc.get("tokens", set()):
-                if token_id not in vocab_index:
-                    vocab_index[token_id] = []
-                vocab_index[token_id].append(hdv_idx)
-
-        self.db.save_vocab_index(vocab_index, len(self.model.tokenizer))
-
         CUDA.clear()
         self.logger.info(f"Index complete: {self.db.count():,} memories")
 
-        # Reorganize to blocked layout
         self.db.finalize_index()
-
-        # Reload indices for retriever
-        self.retriever._token_pos, self.retriever._token_neg = self.db.load_token_hdc()
-        self.retriever._vocab_row_ptrs, self.retriever._vocab_postings = (
-            self.db.load_vocab_index()
-        )
         self.retriever._token_counts = self.db.get_token_counts()
-        self.retriever._idf = self.db.load_idf()
 
         return len(docs)
 
@@ -1827,12 +1406,9 @@ class HdRAG:
         vocab_df: Counter[int],
         docs: list[dict],
     ) -> int:
-        """Process a batch of texts, updating vocab and docs."""
-
         texts = [t for t, _ in items]
         chunk_metas = [m for _, m in items]
 
-        # Generate IDs
         ids = []
         for text, meta in items:
             if meta and "chunk_idx" in meta:
@@ -1846,8 +1422,6 @@ class HdRAG:
             )
 
         existing = self.db.exists(ids)
-
-        # Filter to new items
         new_items = [
             (mid, txt, meta)
             for mid, txt, meta in zip(ids, texts, chunk_metas)
@@ -1871,11 +1445,9 @@ class HdRAG:
         for mid, text, meta, toks in zip(
             new_ids, new_texts, new_metas, encodings.input_ids
         ):
-            # Track tokens for vocab index
             doc_tokens = set(toks) - special
             vocab_df.update(doc_tokens)
 
-            # Build metadata
             doc_meta = {"source": source}
             if meta:
                 doc_meta.update(meta)
@@ -1886,7 +1458,6 @@ class HdRAG:
                     "text": text,
                     "metadata": doc_meta,
                     "token_count": len(toks),
-                    "tokens": doc_tokens,  # Store for vocab index
                 }
             )
 
@@ -1934,7 +1505,7 @@ def create_gradio_app(hdrag: HdRAG):
                 send_btn = gr.Button("Send", variant="primary")
                 clear_btn = gr.Button("New Conversation")
                 use_memory = gr.Checkbox(value=True, label="Use Memory")
-                compress_expand = gr.Checkbox(value=False, label="Compress Context")
+                compress_ctx = gr.Checkbox(value=False, label="Compress Context")
 
             with gr.Accordion("🔍 Debug: Full Prompt Viewer", open=False):
                 debug_viewer = gr.Code(
@@ -1944,7 +1515,7 @@ def create_gradio_app(hdrag: HdRAG):
                     value="Send a message to see the full prompt...",
                 )
 
-            def respond(message, history, budget, use_mem, use_compress_expand):
+            def respond(message, history, budget, use_mem, compress):
                 if not message.strip():
                     yield "", history, ""
                     return
@@ -1962,15 +1533,12 @@ def create_gradio_app(hdrag: HdRAG):
                 history.append({"role": "assistant", "content": ""})
                 yield "", history, f"🔍 Query: {message}"
 
+                memory = ""
                 if use_mem:
-                    if use_compress_expand:
-                        memory = hdrag.compress_expand_context(
-                            message, budget, track=True
-                        )
-                    else:
-                        memory = hdrag.get_context(message, budget, track=True)
-                else:
-                    memory = ""
+                    memory = hdrag.get_context(message, budget, track=True)
+                    if compress and memory:  # apply compression
+                        memory = compress_context(memory)
+
                 sys_prompt = (
                     f"{hdrag.config.system_prompt}\n\n<working_memory>\n{memory}\n</working_memory>"
                     if memory
@@ -2007,12 +1575,12 @@ def create_gradio_app(hdrag: HdRAG):
 
             msg.submit(
                 respond,
-                [msg, chatbot, budget_slider, use_memory, compress_expand],
+                [msg, chatbot, budget_slider, use_memory, compress_ctx],
                 [msg, chatbot, debug_viewer],
             )
             send_btn.click(
                 respond,
-                [msg, chatbot, budget_slider, use_memory, compress_expand],
+                [msg, chatbot, budget_slider, use_memory, compress_ctx],
                 [msg, chatbot, debug_viewer],
             )
             clear_btn.click(clear_conversation, outputs=[chatbot, debug_viewer])
@@ -2091,8 +1659,6 @@ def create_gradio_app(hdrag: HdRAG):
 
             with gr.Accordion("Datasets", open=False):
                 gr.Markdown(f"**Directory:** `{hdrag.config.datasets_dir}`")
-
-                # Get available sources and their counts
                 source_counts = hdrag.db.source_counts()
                 if source_counts:
                     gr.Markdown("**Select datasets to include in search:**")
@@ -2102,12 +1668,11 @@ def create_gradio_app(hdrag: HdRAG):
                         ],
                         value=[
                             f"{src} ({count:,})" for src, count in source_counts.items()
-                        ],  # all selected
+                        ],
                         label="Enabled Datasets",
                     )
 
                     def update_enabled_sources(selected):
-                        # Extract source name from "source (count)" format
                         hdrag.enabled_sources = {s.rsplit(" (", 1)[0] for s in selected}
                         return f"✓ {len(hdrag.enabled_sources)} datasets enabled"
 
@@ -2163,7 +1728,6 @@ def create_gradio_app(hdrag: HdRAG):
             def compute_stats():
                 stats = hdrag.stats()
 
-                # Sparsity gauge
                 sparsity = hdrag.db.compute_sparsity()
                 sparsity_fig = go.Figure(
                     go.Bar(
@@ -2193,15 +1757,11 @@ def create_gradio_app(hdrag: HdRAG):
                     margin=dict(t=40, b=40),
                 )
 
-                # Similarity histogram
                 sims = hdrag.db.sample_similarities(5000)
                 if sims:
                     sim_fig = go.Figure(
                         go.Histogram(
-                            x=sims,
-                            nbinsx=50,
-                            marker_color="#2196F3",
-                            opacity=0.75,
+                            x=sims, nbinsx=50, marker_color="#2196F3", opacity=0.75
                         )
                     )
                     sim_fig.add_vline(
@@ -2221,10 +1781,8 @@ def create_gradio_app(hdrag: HdRAG):
                     sim_fig = go.Figure()
                     sim_fig.add_annotation(text="Not enough documents", showarrow=False)
 
-                # Dimension activation
                 pos_freq, neg_freq = hdrag.db.dimension_activation()
                 if len(pos_freq) > 0:
-                    # Downsample for display if too many dims
                     step = max(1, len(pos_freq) // 500)
                     x = np.arange(0, len(pos_freq), step)
 
@@ -2258,9 +1816,7 @@ def create_gradio_app(hdrag: HdRAG):
                         col=1,
                     )
                     dim_fig.update_layout(
-                        height=350,
-                        margin=dict(t=40, b=40),
-                        showlegend=False,
+                        height=350, margin=dict(t=40, b=40), showlegend=False
                     )
                     dim_fig.update_xaxes(title_text="Dimension", row=2, col=1)
                     dim_fig.update_yaxes(title_text="Freq", tickformat=".0%")
