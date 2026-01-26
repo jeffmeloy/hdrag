@@ -8,7 +8,7 @@ Traditional RAG systems rely on dense vector databases, HdRAG uses a fundamental
 
 - **Ternary Hypervectors**: Documents are encoded as sparse ternary vectors (+1, 0, -1), packed into bitmaps
 - **Bitwise Similarity**: Search uses XOR + popcount operations — fast on CPU
-- **No Vector DB**: Just SQLite + memory-mapped files
+- **No Vector DB**: Just SQLite + memory-mapped file
 - **Local-First**: Everything runs locally with any HuggingFace model
 
 ## Features
@@ -87,12 +87,10 @@ batch_log_interval: 1000                 # Log progress every N batches during e
 # Retrieval
 max_context_tokens: 8192                # Token budget for retrieved context in prompt
 min_context: 6                          # include at least these many dataset items 
-hdc_search_mb: 64                       # candidates to score (L3 cache)
 
 # Database
 sqlite_max_vars: 900                    # Chunk size for IN clauses (SQLite limit ~999)
 sqlite_cache_kb: 64000                  # SQLite page cache size in KB (64MB)
-sqlite_mmap_bytes: 2147483648           # SQLite mmap size
 
 # UI
 gradio_port: 7860                       # Local port for Gradio web interface
@@ -139,19 +137,16 @@ Click the **🔄 Index** button in the Config tab to build the HDC index.
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │ ModelManager│  │  HDCEncoder │  │     Retriever       │  │
 │  │             │  │             │  │                     │  │
-│  │ • Tokenizer │  │ • Random    │  │ • Vocab Index       │  │
-│  │ • Embeddings│  │   Projection│  │ • HDC Scoring       │  │
-│  │ • Generation│  │ • Ternary   │  │ • Deduplication     │  │
-│  │             │  │   Threshold │  │ • Context Assembly  │  │
+│  │ • Tokenizer │  │ • Random    │  │ • HDC Scoring       │  │
+│  │ • Embeddings│  │   Projection│  │ • Deduplication     │  │
+│  │ • Generation│  │ • Ternary   │  │ • Context Assembly  │  │
+│  │             │  │   Threshold │  │                     │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │                    Database                         │    │
-│  │  • SQLite: metadata, IDF weights, config            │    │
-│  │  • corpus_hdc.idx: document bitmaps (mmap)          │    │
-│  │  • token_hdc.idx: vocabulary bitmaps (mmap)         │    │
-│  │  • vocab.idx: inverted index (CSR format)           │    │
-│  └─────────────────────────────────────────────────────┘    │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                    Database                           │  │
+│  │  • SQLite: metadata, IDF weights, config              │  │
+│  │  • token_hdc.idx: vocabulary bitmaps (mmap)           │  │
+│  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -179,10 +174,8 @@ Normalized by `sqrt(self_similarity)` for length invariance.
 
 When "Compress Context" is enabled:
 1. Retrieve documents normally (fills token budget)
-2. Tokenize and extract unique tokens (preserving order)
-3. Compute local median IDF of context tokens
-4. Keep only tokens with IDF ≥ median
-5. Decode back to text
+2. Compute local median IDF of context
+3. Keep only word with IDF ≥ median
 
 This produces a "concept cloud" rather than prose — useful for:
 - Small models that copy context too literally
@@ -191,10 +184,7 @@ This produces a "concept cloud" rather than prose — useful for:
 
 ### Deduplication
 
-Three-stage filtering:
-1. **Exact**: Remove identical normalized text
-2. **Subset**: Remove docs whose token set ⊆ another doc's
-3. **Near-duplicate**: Otsu-thresholded bitmap similarity
+-**Near-duplicate**: Otsu-thresholded bitmap similarity
 
 ### Storage Format
 
@@ -202,8 +192,6 @@ Three-stage filtering:
 |------|----------|
 | `index.db` | SQLite: memories, IDF weights, config |
 | `corpus_hdc.idx` | Document bitmaps (blocked: all pos, then all neg) |
-| `token_hdc.idx` | Vocabulary bitmaps for query expansion |
-| `vocab.idx` | Inverted index (CSR: row_ptrs + postings) |
 | `projection.pt` | Random projection matrix |
 
 ## Configuration Reference
@@ -214,7 +202,6 @@ Three-stage filtering:
 | `hdc_seed` | Random projection seed | 42 |
 | `max_context_tokens` | Token budget for retrieval | 4000 |
 | `min_context` | Minimum documents to retrieve | 3 |
-| `hdc_search_mb` | Memory budget for candidate scoring | 64 |
 | `text_chunk_size` | Tokens per chunk for .txt files | 1024 |
 | `text_chunk_overlap` | Overlap between chunks | 128 |
 
@@ -246,8 +233,6 @@ Three-stage filtering:
 
 ## Limitations
 
-- Assumes spherical similarity (no learned metric)
-- Random projection loses some semantic precision vs. dense vectors
 - Context compression is experimental — may hurt coherence for some tasks
 
 ## License
