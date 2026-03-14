@@ -2,20 +2,12 @@
 hdrag_model - Shared foundation for HdRAG.
 
 Config, GGUF utilities, llama.cpp server management,
-inference engine (tokenizer + generation via server HTTP API),
-and conversation logging.
+inference engine (generation via server HTTP API),
+HuggingFace tokenizer (loaded from GGUF), and conversation logging.
 
-Tokenization is delegated entirely to llama-server's /tokenize endpoint.
-The GGUF file is the single source of truth for vocabulary, merge rules,
-and pre-tokenizer patterns. No Python reimplementation of BPE.
-
-Server has two mutually exclusive modes:
-  tokenize  — CPU only (-ngl 0, -c 8), boots in ~1s, for indexing
-  inference — full GPU (-ngl N, -c K), boots in ~6s, for chat
-
-They never coexist. Transitions are explicit: indexing kills inference
-server, starts tokenize server, tokenizes, kills it. Next chat message
-starts inference server.
+Tokenization is handled in-process by HuggingFaceTokenizer, which
+extracts the tokenizer directly from the GGUF file via transformers.
+The llama.cpp server is used only for text generation.
 
 This module has zero dependency on the HDC memory engine (hdrag.py)
 or the Gradio UI (hdrag_gradio.py).
@@ -23,7 +15,15 @@ or the Gradio UI (hdrag_gradio.py).
 
 from __future__ import annotations
 
-import json, logging, os, re, signal, subprocess, time, threading
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import tempfile
+import time
+import threading
 from dataclasses import dataclass, asdict, fields
 import dataclasses
 from datetime import datetime
@@ -34,67 +34,7 @@ import numpy as np
 import yaml
 import requests
 from gguf import GGUFReader
-
-
-# ── Tokenizer Protocol ────────────────────────────────────────────
-
-
-@runtime_checkable
-class Tokenizer(Protocol):
-    """Structural interface consumed by the HDC memory engine."""
-
-    def tokenize(self, text: str) -> list[int]: ...
-    def bulk_tokenize(self, texts: list[str]) -> list[list[int]]: ...
-    def count_tokens(self, text: str) -> int: ...
-    def detokenize(self, tokens: list[int]) -> str: ...
-
-    @property
-    def vocab_size(self) -> int: ...
-
-    @property
-    def special_ids(self) -> set[int]: ...
-
-
-# ── OS Utilities ──────────────────────────────────────────────────
-
-
-def trim_working_set(*child_procs: subprocess.Popen):
-    """Release unused physical pages back to the OS (Windows only)."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-
-        k32 = ctypes.windll.kernel32
-        k32.SetProcessWorkingSetSizeEx(
-            k32.GetCurrentProcess(),
-            ctypes.c_size_t(-1),
-            ctypes.c_size_t(-1),
-            0,
-        )
-        PROCESS_SET_QUOTA = 0x0100
-        PROCESS_QUERY_INFORMATION = 0x0400
-        for proc in child_procs:
-            if proc is None or proc.poll() is not None:
-                continue
-            h = k32.OpenProcess(
-                PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION,
-                False,
-                proc.pid,
-            )
-            if h:
-                k32.SetProcessWorkingSetSizeEx(
-                    h,
-                    ctypes.c_size_t(-1),
-                    ctypes.c_size_t(-1),
-                    0,
-                )
-                k32.CloseHandle(h)
-    except Exception:
-        pass
-
-
-# ── GGUF Helpers ──────────────────────────────────────────────────
+from transformers import AutoTokenizer
 
 
 def gguf_bytes(field) -> Generator[bytes, None, None]:
@@ -132,6 +72,22 @@ def gguf_field(reader, key: str, default=None):
     return default
 
 
+def close_gguf_reader(reader: GGUFReader):
+    """Close a GGUFReader and release its mmap immediately."""
+    try:
+        if hasattr(reader, "tensors"):
+            reader.tensors.clear()
+        if hasattr(reader, "fields"):
+            reader.fields.clear()
+        if hasattr(reader, "data") and reader.data is not None:
+            mm = getattr(reader.data, "_mmap", None)
+            if mm is not None:
+                mm.close()
+            reader.data = None
+    except Exception:
+        pass
+
+
 def resolve_gguf(name: str, model_dir: str) -> str:
     if not name:
         return ""
@@ -149,16 +105,13 @@ def resolve_gguf(name: str, model_dir: str) -> str:
     return ""
 
 
-# ── Config ─────────────────────────────────────────────────────────
-
-
 @dataclass
 class Config:
     chat_history_dir: str
     hdrag_dir: str
     datasets_dir: str
     model_dir: str
-    gguf_model: str
+    gguf_model: str  # inference model (LLM)
     llama_cpp_dir: str
     llama_server_url: str
     llama_gpu_layers: int
@@ -177,13 +130,17 @@ class Config:
     sqlite_cache_kb: int
     gradio_port: int
     system_prompt: str
-    llama_context_size: int = 8192
+    llama_context_size: int = 0  # 0 = auto (--fit decides)
     llama_batch_size: int = 2048
     llama_ubatch_size: int = 512
     llama_cache_type_k: str = "q8_0"
     llama_cache_type_v: str = "q8_0"
     llama_parallel: int = 1
+    nthreads: int = 0  # 0 = auto (os.cpu_count)
     llama_cache_reuse: int = 8192  # deprecated, ignored
+    llama_no_mmap: bool = True
+    llama_flash_attn: bool = True
+    llama_sleep_idle: int = 0  # 0 = disabled, N = unload after N seconds idle
     stop_sequences: list = None
 
     def save(self, path: str):
@@ -211,28 +168,214 @@ class Config:
         return cls(**filtered)
 
 
-# ── LLama Server ───────────────────────────────────────────────────
+@runtime_checkable
+class Tokenizer(Protocol):
+    """Structural interface consumed by the HDC memory engine."""
 
-# Server modes
-TOKENIZE = "tokenize"  # CPU only, vocab lookup, -ngl 0, minimal context
-INFERENCE = "inference"  # Full GPU, generation, full context + KV cache
+    def tokenize(self, text: str) -> list[int]: ...
+    def bulk_tokenize(self, texts: list[str]) -> list[list[int]]: ...
+    def count_tokens(self, text: str) -> int: ...
+    def detokenize(self, tokens: list[int]) -> str: ...
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def special_ids(self) -> set[int]: ...
+
+
+def _collect_special_ids(tokenizer) -> set[int]:
+    """Collect ALL special token IDs from an HF tokenizer."""
+    ids: set[int] = set()
+    if hasattr(tokenizer, "added_tokens_encoder"):
+        ids.update(tokenizer.added_tokens_encoder.values())
+    if hasattr(tokenizer, "all_special_ids"):
+        ids.update(tokenizer.all_special_ids)
+    if hasattr(tokenizer, "additional_special_tokens_ids"):
+        ids.update(tokenizer.additional_special_tokens_ids)
+    ids.discard(None)
+    ids.discard(-1)
+    return ids
+
+
+class HuggingFaceTokenizer:
+    """In-process tokenizer via HuggingFace transformers."""
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        logger: Optional[logging.Logger] = None,
+        trust_remote_code: bool = False,
+    ):
+        """Load tokenizer from HuggingFace model name or local directory."""
+        self.logger = logger or logging.getLogger(__name__)
+        self.logger.info(f"Loading HF tokenizer: {model_name_or_path}")
+
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+        )
+        self._special_ids = _collect_special_ids(self._tokenizer)
+
+        self.logger.info(
+            f"HF tokenizer ready: vocab={self.vocab_size:,} "
+            f"special={len(self._special_ids)} "
+            f"type={type(self._tokenizer).__name__}"
+        )
+
+    @classmethod
+    def from_gguf(
+        cls,
+        gguf_path: str,
+        logger: Optional[logging.Logger] = None,
+    ) -> "HuggingFaceTokenizer":
+        """Load tokenizer directly from a GGUF file."""
+        logger = logger or logging.getLogger(__name__)
+        logger.info(f"Extracting tokenizer from GGUF: {gguf_path}")
+
+        from transformers.integrations.ggml import convert_gguf_tokenizer
+
+        tokenizer_dict, tokenizer_config, architecture = (
+            cls._extract_tokenizer_from_gguf(gguf_path, logger)
+        )
+
+        logger.info(
+            f"GGUF tokenizer type: {tokenizer_dict.get('tokenizer_type', '?')!r}, "
+            f"converter: {architecture!r}, "
+            f"vocab tokens: {len(tokenizer_dict.get('tokens', []))}"
+        )
+
+        fast_tokenizer, additional_kwargs = convert_gguf_tokenizer(
+            architecture, tokenizer_dict
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fast_tokenizer.save(str(Path(tmp_dir) / "tokenizer.json"))
+
+            config = {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "model_type": architecture,
+            }
+            config.update(additional_kwargs)
+            config.update(tokenizer_config)
+
+            with open(Path(tmp_dir) / "tokenizer_config.json", "w") as f:
+                json.dump(config, f)
+
+            instance = cls.__new__(cls)
+            instance.logger = logger
+            instance._tokenizer = AutoTokenizer.from_pretrained(tmp_dir)
+            instance._special_ids = _collect_special_ids(instance._tokenizer)
+
+        logger.info(
+            f"GGUF tokenizer ready: vocab={instance.vocab_size:,} "
+            f"special={len(instance._special_ids)} "
+            f"type={type(instance._tokenizer).__name__}"
+        )
+
+        return instance
+
+    @staticmethod
+    def _extract_tokenizer_from_gguf(
+        gguf_path: str,
+        logger: logging.Logger,
+    ) -> tuple[dict, dict, str]:
+        """Extract tokenizer dict directly from GGUF metadata."""
+        from transformers.modeling_gguf_pytorch_utils import (
+            GGUF_TOKENIZER_MAPPING,
+            _gguf_parse_value,
+        )
+        from transformers.integrations.ggml import GGUF_TO_FAST_CONVERTERS
+
+        reader = GGUFReader(str(gguf_path))
+
+        # Parse all tokenizer.* fields from GGUF
+        tokenizer_dict: dict = {}
+        tokenizer_config: dict = {}
+        for gguf_key, field in reader.fields.items():
+            if not gguf_key.startswith("tokenizer."):
+                continue
+            config_key = gguf_key.split(".", 1)[1]  # strip "tokenizer."
+            value = [_gguf_parse_value(field.parts[i], field.types) for i in field.data]
+            if len(value) == 1:
+                value = value[0]
+
+            # Map to tokenizer_dict keys
+            for category, renames in GGUF_TOKENIZER_MAPPING.items():
+                if config_key in renames:
+                    renamed = renames[config_key]
+                    if category == "tokenizer":
+                        tokenizer_dict[renamed] = value
+                    elif category == "tokenizer_config":
+                        tokenizer_config[renamed] = value
+
+        # Determine the right converter from tokenizer type + model arch
+        arch = gguf_field(reader, "general.architecture", "unknown")
+        tok_type = tokenizer_dict.get("tokenizer_type", "")
+
+        # Try model architecture first (exact match or known alias)
+        converter = None
+        for candidate in [arch, arch.replace("-", "_"), arch.replace("-", "")]:
+            if candidate in GGUF_TO_FAST_CONVERTERS:
+                converter = candidate
+                break
+
+        # Fall back to tokenizer type (gpt2 → gpt2, llama → llama)
+        if converter is None and tok_type in GGUF_TO_FAST_CONVERTERS:
+            converter = tok_type
+            logger.info(
+                f"Unknown architecture {arch!r}, "
+                f"using {tok_type!r} converter based on tokenizer type"
+            )
+
+        if converter is None:
+            close_gguf_reader(reader)
+            raise ValueError(
+                f"Cannot determine tokenizer converter for GGUF with "
+                f"architecture={arch!r}, tokenizer_type={tok_type!r}. "
+                f"Supported: {sorted(GGUF_TO_FAST_CONVERTERS.keys())}"
+            )
+
+        close_gguf_reader(reader)
+        del reader
+        return tokenizer_dict, tokenizer_config, converter
+
+    def tokenize(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text, add_special_tokens=False)
+
+    def bulk_tokenize(self, texts: list[str]) -> list[list[int]]:
+        if not texts:
+            return []
+        return self._tokenizer(
+            texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+        )["input_ids"]
+
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenize(text))
+
+    def detokenize(self, tokens: list[int]) -> str:
+        return self._tokenizer.decode(tokens, skip_special_tokens=False)
+
+    @property
+    def vocab_size(self) -> int:
+        return self._tokenizer.vocab_size
+
+    @property
+    def special_ids(self) -> set[int]:
+        return self._special_ids
+
+    def start_for_indexing(self):
+        """No-op — no server to start."""
+
+    def stop_server(self):
+        """No-op — no server to stop."""
 
 
 class LlamaServer:
-    """Manages a single llama-server process in one of two modes.
-
-    tokenize  — CPU only (-ngl 0, -c 8). Loads vocab + merge table only.
-                No GPU memory, no KV cache. Boots in ~1 second.
-                Used during indexing for /tokenize endpoint.
-
-    inference — Full GPU (-ngl N, -c K, KV cache, --jinja).
-                Full model on VRAM. Boots in ~6 seconds.
-                Used during chat for /v1/chat/completions.
-
-    Modes are mutually exclusive. Switching modes stops the current
-    process and starts a new one. The /tokenize endpoint works in
-    both modes, so chat-time token counting doesn't trigger a switch.
-    """
+    """Manages a single llama-server process for inference."""
 
     def __init__(
         self, config: Config, logger: logging.Logger, model_pathname: str = ""
@@ -241,11 +384,10 @@ class LlamaServer:
         self.logger = logger
         self.model_pathname = model_pathname
         self._proc: Optional[subprocess.Popen] = None
-        self._mode: Optional[str] = None
         self._lock = threading.Lock()
         self._log_file = None
+        self._n_ctx: int = 0  # actual context size, set after server ready
 
-        # Log directory for server output
         self._log_dir = Path(config.hdrag_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -254,8 +396,9 @@ class LlamaServer:
         return self._proc
 
     @property
-    def mode(self) -> Optional[str]:
-        return self._mode
+    def context_length(self) -> int:
+        """Actual context size the server is running with."""
+        return self._n_ctx
 
     def stop(self):
         """Terminate the server and free all its resources."""
@@ -263,13 +406,11 @@ class LlamaServer:
             self._stop_locked()
 
     def _stop_locked(self):
-        """Inner stop — caller must hold self._lock."""
         if self._proc is None or self._proc.poll() is not None:
             self._proc = None
-            self._mode = None
             self._close_log()
             return
-        self.logger.info(f"Stopping server (mode={self._mode})")
+        self.logger.info("Stopping llama-server")
         self._proc.terminate()
         try:
             self._proc.wait(timeout=10)
@@ -277,7 +418,6 @@ class LlamaServer:
             self._proc.kill()
             self._proc.wait(timeout=5)
         self._proc = None
-        self._mode = None
         self._close_log()
 
     def _close_log(self):
@@ -288,26 +428,16 @@ class LlamaServer:
                 pass
             self._log_file = None
 
-    def start(self, mode: str = INFERENCE):
-        """Start in requested mode. Idempotent, thread-safe.
-
-        If already running in the requested mode → no-op.
-        If running in wrong mode → stop, then start in new mode.
-        If not running → start fresh.
-        """
+    def start(self):
+        """Start the server if not already running. Idempotent, thread-safe."""
         with self._lock:
             if not self.config.llama_cpp_dir or not self.model_pathname:
                 return
-            # Already running in correct mode
-            if self._proc and self._proc.poll() is None and self._mode == mode:
-                return
-            # Wrong mode or dead process — stop first
             if self._proc and self._proc.poll() is None:
-                self._stop_locked()
-            self._start_locked(mode)
+                return
+            self._start_locked()
 
-    def _start_locked(self, mode: str):
-        """Build command and start process. Caller must hold self._lock."""
+    def _start_locked(self):
         from urllib.parse import urlparse
 
         ext = ".exe" if os.name == "nt" else ""
@@ -323,43 +453,40 @@ class LlamaServer:
             parsed.hostname or "127.0.0.1",
             "--port",
             str(parsed.port or 8080),
+            "-t",
+            str(cfg.nthreads or os.cpu_count() or 4),
+            "-ngl",
+            str(cfg.llama_gpu_layers),
+            "-b",
+            str(cfg.llama_batch_size),
+            "-ub",
+            str(cfg.llama_ubatch_size),
+            "--cache-type-k",
+            cfg.llama_cache_type_k,
+            "--cache-type-v",
+            cfg.llama_cache_type_v,
+            "-np",
+            str(cfg.llama_parallel),
+            "--jinja",
         ]
 
-        if mode == TOKENIZE:
-            # CPU only, vocab lookup only. --no-warmup prevents paging
-            # in model weights via mmap (only vocab pages get faulted).
-            cmd += ["-ngl", "0", "-c", "8", "--no-warmup"]
-        else:
-            # Full inference — GPU offload, large context, KV cache
-            cmd += [
-                "-ngl",
-                str(cfg.llama_gpu_layers),
-                "-c",
-                str(cfg.llama_context_size),
-                "-b",
-                str(cfg.llama_batch_size),
-                "-ub",
-                str(cfg.llama_ubatch_size),
-                "--cache-type-k",
-                cfg.llama_cache_type_k,
-                "--cache-type-v",
-                cfg.llama_cache_type_v,
-                "-np",
-                str(cfg.llama_parallel),
-                "--jinja",
-            ]
+        if cfg.llama_context_size > 0:
+            cmd.extend(["-c", str(cfg.llama_context_size)])
 
-        self.logger.info(f"Starting ({mode}): {' '.join(cmd)}")
+        if cfg.llama_no_mmap:
+            cmd.append("--no-mmap")
+        if cfg.llama_flash_attn:
+            cmd.extend(["--flash-attn", "on"])
+        if cfg.llama_sleep_idle > 0:
+            cmd.extend(["--sleep-idle-seconds", str(cfg.llama_sleep_idle)])
 
-        # Server output → log file for crash diagnostics
+        self.logger.info(f"Starting llama-server: {' '.join(cmd)}")
+
         self._close_log()
         log_path = self._log_dir / "llama_server.log"
         self._log_file = open(log_path, "w")
 
-        kwargs = {
-            "stdout": self._log_file,
-            "stderr": subprocess.STDOUT,
-        }
+        kwargs = {"stdout": self._log_file, "stderr": subprocess.STDOUT}
         if os.name != "nt":
             import ctypes
 
@@ -367,7 +494,6 @@ class LlamaServer:
             kwargs["preexec_fn"] = lambda: libc.prctl(1, signal.SIGTERM)
 
         self._proc = subprocess.Popen(cmd, **kwargs)
-        self._mode = mode
         if os.name == "nt":
             self._bind_job()
         self._wait_ready()
@@ -421,31 +547,52 @@ class LlamaServer:
             try:
                 r = requests.get(url, timeout=2)
                 if r.ok and r.json().get("status") == "ok":
-                    self.logger.info(f"llama.cpp ready ({self._mode})")
+                    self._query_props()
+                    self.logger.info(f"llama.cpp ready (n_ctx={self._n_ctx:,})")
                     return
             except (requests.ConnectionError, requests.Timeout):
                 pass
             time.sleep(0.5)
         raise TimeoutError(f"llama.cpp not ready after {timeout}s")
 
+    def _query_props(self):
+        """Query the server for its actual runtime configuration."""
+        base = self.config.llama_server_url.rstrip("/")
+        try:
+            r = requests.get(f"{base}/props", timeout=5)
+            if r.ok:
+                props = r.json()
+                gen = props.get("default_generation_settings", {})
+                n_ctx = gen.get("n_ctx", 0)
+                if n_ctx > 0:
+                    self._n_ctx = n_ctx
+                    return
+        except Exception as e:
+            self.logger.debug(f"Failed to query /props: {e}")
+        # Fallback: use config value or a safe default
+        self._n_ctx = self.config.llama_context_size or 4096
 
-# ── Inference Engine ──────────────────────────────────────────────
+    def clear_kv_cache(self):
+        """Flush KV cache from all server slots to reclaim VRAM."""
+        if self._proc is None or self._proc.poll() is not None:
+            return
+        base = self.config.llama_server_url.rstrip("/")
+        try:
+            # Get slot info, erase each active slot's cache
+            r = requests.get(f"{base}/slots", timeout=5)
+            if r.ok:
+                for slot in r.json():
+                    slot_id = slot.get("id", 0)
+                    requests.post(
+                        f"{base}/slots/{slot_id}?action=erase",
+                        timeout=5,
+                    )
+        except (requests.ConnectionError, requests.Timeout, Exception) as e:
+            self.logger.debug(f"KV cache clear failed: {e}")
 
 
 class InferenceEngine:
-    """Tokenizer + generation via llama.cpp server.
-
-    Tokenization is delegated to the server's /tokenize endpoint.
-    The /tokenize endpoint works in both server modes (tokenize and
-    inference), so chat-time token counting doesn't trigger a mode
-    switch. Only generate() requires inference mode.
-
-    Static vocabulary metadata (vocab_size, special token IDs, context
-    length) is read once from the GGUF at construction time.
-
-    Satisfies the Tokenizer protocol so it can be passed directly
-    to HdRAG.
-    """
+    """Generation + token counting via llama.cpp server."""
 
     def __init__(
         self,
@@ -453,6 +600,7 @@ class InferenceEngine:
         logger: logging.Logger,
         server: LlamaServer,
         gguf_path: str = "",
+        tokenizer: Tokenizer = None,
     ):
         self.config = config
         self.logger = logger
@@ -461,53 +609,22 @@ class InferenceEngine:
         self._session = requests.Session()
         self._base_url = config.llama_server_url.rstrip("/")
         self._gguf_system_prompt = ""
-
-        # Static metadata from GGUF (immutable, read once)
-        self._vocab_size = 0
-        self._special_ids: set[int] = set()
-        self._context_length = config.llama_context_size
+        self._tokenizer = tokenizer
 
         if gguf_path:
             self._read_gguf_metadata()
 
     def _read_gguf_metadata(self):
-        """Read all static metadata from the GGUF in one pass.
-
-        Single file open for vocab size, special IDs, context length,
-        and chat template. These are immutable after the file is written.
-        """
+        """Read chat template from the GGUF."""
         reader = GGUFReader(str(self.model_pathname))
 
-        # Vocab size
-        tokens_field = reader.fields.get("tokenizer.ggml.tokens")
-        if tokens_field:
-            self._vocab_size = sum(1 for _ in gguf_bytes(tokens_field))
-
-        # Special token IDs
-        bos = gguf_int(reader, "tokenizer.ggml.bos_token_id")
-        eos = gguf_int(reader, "tokenizer.ggml.eos_token_id")
-        pad = gguf_int(reader, "tokenizer.ggml.padding_token_id")
-        self._special_ids = {x for x in (bos, eos, pad) if x is not None}
-
-        # Context length from model metadata
         arch = gguf_field(reader, "general.architecture", "unknown")
-        ctx = gguf_field(reader, f"{arch}.context_length", None)
-        if ctx is not None:
-            self._context_length = min(ctx, self.config.llama_context_size)
+        self.logger.info(f"GGUF metadata: arch={arch!r}")
 
-        # Tokenizer identity for diagnostics
-        tok_model = gguf_field(reader, "tokenizer.ggml.model", "unknown")
-        tok_pre = gguf_field(reader, "tokenizer.ggml.pre", "default")
-
-        self.logger.info(
-            f"GGUF metadata: vocab={self._vocab_size:,} "
-            f"ctx={self._context_length:,} "
-            f"model={tok_model!r} pre={tok_pre!r} "
-            f"special={self._special_ids}"
-        )
-
-        # Chat template → system prompt
         tmpl = gguf_field(reader, "tokenizer.chat_template", "")
+        close_gguf_reader(reader)
+        del reader
+
         if tmpl:
             self.logger.info(f"GGUF chat template: {len(tmpl)} chars")
             for pat in (
@@ -522,149 +639,29 @@ class InferenceEngine:
                     )
                     break
 
-    # ── Server lifecycle ──
-
-    def start_for_indexing(self):
-        """Start server in tokenize-only mode (CPU, no GPU memory)."""
-        self._server.start(TOKENIZE)
-
-    def stop_server(self):
-        """Stop the server entirely. Next call auto-restarts as needed."""
-        self._server.stop()
-
-    # ── Tokenizer interface (satisfies Tokenizer protocol) ──
-
     def _ensure_server(self):
-        """Ensure some server is running (any mode).
-
-        /tokenize works in both tokenize and inference modes.
-        If already running → no-op.
-        If dead → restart in last mode (or inference as default).
-        """
         proc = self._server.process
         if proc and proc.poll() is None:
-            return  # alive, don't care which mode
-        # Dead or never started — restart in last mode or default
-        last = self._server.mode or INFERENCE
+            return
         if proc and proc.poll() is not None:
-            rc = proc.returncode
             self.logger.warning(
-                f"Server died (exit={rc}), restarting in {last} mode. "
+                f"Server died (exit={proc.returncode}), restarting. "
                 f"Check llama_server.log for details."
             )
-        self._server.start(last)
+        self._server.start()  # re-queries /props, refreshes context_length
 
-    def tokenize(self, text: str) -> list[int]:
-        limit = self.config.max_context_tokens
-        if len(text) <= limit:
-            return self._tokenize_one(text)
-        return self._tokenize_long(text, limit)
-
-    def _tokenize_long(self, text: str, limit: int) -> list[int]:
-        """Split text into regex-safe pieces, tokenize, concatenate.
-
-        The GPT-4o pre-tokenizer regex has nested lookahead quantifiers
-        that cause catastrophic backtracking on long runs of similar
-        characters (DNA sequences, base64, repeated patterns). Splitting
-        on newlines first keeps each piece naturally short. Lines still
-        over the limit get split on whitespace, then hard-cut as last
-        resort to keep any single regex invocation under _HARD_LIMIT.
-        """
-        pieces = []
-        buf = []
-        buf_len = 0
-        hard = min(limit, 2000)  # regex-safe ceiling per piece
-
-        for line in text.split("\n"):
-            added = len(line) + (1 if buf else 0)
-            if buf and buf_len + added > limit:
-                pieces.append("\n".join(buf))
-                buf = []
-                buf_len = 0
-
-            if len(line) > hard:
-                # Flush buffer first
-                if buf:
-                    pieces.append("\n".join(buf))
-                    buf = []
-                    buf_len = 0
-                # Split long line on whitespace, then hard-cut
-                pos = 0
-                while pos < len(line):
-                    end = pos + hard
-                    if end < len(line):
-                        split = line.rfind(" ", pos, end)
-                        if split <= pos:
-                            split = end  # no whitespace — hard cut
-                        end = split
-                    pieces.append(line[pos:end])
-                    pos = end
-            else:
-                buf.append(line)
-                buf_len += added
-
-        if buf:
-            pieces.append("\n".join(buf))
-
-        tokens = []
-        for piece in pieces:
-            tokens.extend(self._tokenize_one(piece))
-        return tokens
-
-    def _tokenize_one(self, text: str) -> list[int]:
-        """Tokenize a single chunk via server /tokenize endpoint."""
-        self._ensure_server()
-        for attempt in range(3):
-            try:
-                r = self._session.post(
-                    f"{self._base_url}/tokenize",
-                    json={"content": text, "add_special": False},
-                    timeout=30,
-                )
-                if r.status_code == 500:
-                    # Server alive but can't tokenize this input
-                    self.logger.warning(
-                        f"Tokenize 500: {repr(text[:120])}... "
-                        f"(len={len(text)}) — skipping"
-                    )
-                    return []
-                r.raise_for_status()
-                return r.json()["tokens"]
-            except (requests.ConnectionError, requests.Timeout):
-                if attempt == 2:
-                    raise
-                self._ensure_server()
-                time.sleep(0.5 + attempt)
-
-    def bulk_tokenize(self, texts: list[str]) -> list[list[int]]:
-        return [self.tokenize(t) for t in texts]
+    def stop_server(self):
+        self._server.stop()
 
     def count_tokens(self, text: str) -> int:
-        return len(self.tokenize(text))
-
-    def detokenize(self, tokens: list[int]) -> str:
-        self._ensure_server()
-        r = self._session.post(
-            f"{self._base_url}/detokenize",
-            json={"tokens": tokens},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()["content"]
-
-    @property
-    def vocab_size(self) -> int:
-        return self._vocab_size
-
-    @property
-    def special_ids(self) -> set[int]:
-        return self._special_ids
+        if self._tokenizer is None:
+            return len(text) // 4
+        return self._tokenizer.count_tokens(text)
 
     @property
     def context_length(self) -> int:
-        return self._context_length
-
-    # ── System prompt ──
+        """Actual context size from the running server."""
+        return self._server.context_length
 
     def build_system_prompt(self, memory: str = "") -> str:
         parts = []
@@ -676,24 +673,41 @@ class InferenceEngine:
             return f"{base}\n\n<working_memory>\n{memory}\n</working_memory>"
         return base
 
-    # ── Generation ──
-
     def generate(self, messages: list[dict]) -> str:
-        self._server.start(INFERENCE)  # ensure GPU mode
+        """Blocking generation — returns full response."""
+        chunks = []
+        for chunk in self.generate_stream(messages):
+            chunks.append(chunk)
+        return "".join(chunks)
+
+    def generate_stream(self, messages: list[dict]) -> Generator[str, None, None]:
+        """Streaming generation — yields token chunks as they arrive."""
+        self._server.start()
         payload = {
             "model": Path(self.model_pathname).stem,
             "messages": messages,
             "max_tokens": self.config.max_new_tokens,
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
+            "stream": True,
         }
         if self.config.stop_sequences:
             payload["stop"] = self.config.stop_sequences
-        resp = self._session.post(
-            f"{self._base_url}/v1/chat/completions",
-            json=payload,
-            timeout=300,
-        )
+        try:
+            resp = self._session.post(
+                f"{self._base_url}/v1/chat/completions",
+                json=payload,
+                timeout=300,
+                stream=True,
+            )
+        except requests.ConnectionError:
+            self._ensure_server()
+            resp = self._session.post(
+                f"{self._base_url}/v1/chat/completions",
+                json=payload,
+                timeout=300,
+                stream=True,
+            )
         if not resp.ok:
             body = ""
             try:
@@ -702,16 +716,29 @@ class InferenceEngine:
                 pass
             self.logger.error(f"[Generate] {resp.status_code} from llama.cpp: {body}")
             if resp.status_code == 400 and "exceed" in body.lower():
-                return (
+                yield (
                     "\u26a0\ufe0f Context overflow \u2014 the prompt exceeded "
                     "the model's context window. Try a shorter message, clear "
                     "the conversation, or reduce the token budget."
                 )
+                return
             resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-
-# ── Conversation Logger ────────────────────────────────────────────
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+                delta = chunk["choices"][0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    yield content
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
 
 
 class ConversationLogger:

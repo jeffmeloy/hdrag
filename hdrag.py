@@ -1,68 +1,89 @@
 """
 hdrag - Hyperdimensional Retrieval-Augmented Generation (Memory Engine)
 
-Indexing:  text → tokenize → embed → project → ternary quantize → pos/neg bitmaps
-Retrieval: query → encode → prune → threshold → rerank → context
+Indexing:  text → strip keys → tokenize → project → IDF weight → ternary quantize → pos/neg bitmaps
+Retrieval: query → strip keys → encode → prune → threshold → MMR → context
 
 This module has zero dependency on the Gradio UI (hdrag_gradio.py)
 or the inference pipeline (generation lives in hdrag_model.InferenceEngine).
-It depends on hdrag_model for Config, tokenizer, and GGUF helpers.
+It depends on hdrag_model for Config and tokenizer only.
 """
 
 from __future__ import annotations
 
-import gc, hashlib, json, logging, math, os, sqlite3
-import statistics, time
+import gc
+import hashlib
+import json
+import logging
+import math
+import re
+import os
+import sqlite3
+import zlib
+import statistics
+import threading
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Generator, Optional
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
-from gguf import GGUFReader
 
-from hdrag_model import (
-    Config,
-    Tokenizer,
-    trim_working_set,
-    gguf_bytes,
-    gguf_int,
-    gguf_field,
+from hdrag_model import Config, Tokenizer
+
+
+class ArrayStore:
+    """Scoped lifecycle manager for shared numpy arrays."""
+
+    __slots__ = ("_store",)
+
+    def __init__(self):
+        self._store: dict[str, np.ndarray] = {}
+
+    def set(self, k: str, v: np.ndarray) -> np.ndarray:
+        self._store[k] = v
+        return v
+
+    def get(self, k: str) -> Optional[np.ndarray]:
+        return self._store.get(k)
+
+    def pop(self, k: str) -> Optional[np.ndarray]:
+        return self._store.pop(k, None)
+
+    def keys(self) -> list[str]:
+        return list(self._store.keys())
+
+    def clear(self):
+        self._store.clear()
+
+    def __contains__(self, k: str) -> bool:
+        return k in self._store
+
+    def nbytes(self) -> int:
+        return sum(v.nbytes for v in self._store.values() if hasattr(v, "nbytes"))
+
+
+_arrays = ArrayStore()
+
+
+# Structural key stripping for better retrieval focus (e.g. "question:", "answer:", etc.)
+_STRUCTURAL_PREFIX_RE = re.compile(r"^\w+\s*:\s*", re.MULTILINE)
+
+
+# Flat key pairs
+_HUMAN_KEYS = (
+    "human",
+    "user",
+    "prompt",
+    "problem",
+    "question",
+    "instruction",
+    "message_1",
 )
 
-
-# ── Tensor Registry ────────────────────────────────────────────────
-
-_T: dict[str, torch.Tensor] = {}
-
-
-def tset(k: str, v: torch.Tensor) -> torch.Tensor:
-    _T[k] = v.cpu() if v.device.type != "cpu" else v
-    return _T[k]
-
-
-def tget(k: str) -> Optional[torch.Tensor]:
-    return _T.get(k)
-
-
-def tdel(k: str):
-    _T.pop(k, None)
-
-
-# ── Constants & Core Math ──────────────────────────────────────────
-
-_M1, _M2, _M4, _H01 = (
-    np.uint64(x)
-    for x in (
-        0x5555555555555555,
-        0x3333333333333333,
-        0x0F0F0F0F0F0F0F0F,
-        0x0101010101010101,
-    )
-)
+_ASSIST_KEYS = ("gpt", "assistant", "response", "answer", "output", "message_2")
 
 
 def bstride(d_hdc: int) -> int:
@@ -70,52 +91,47 @@ def bstride(d_hdc: int) -> int:
     return d + (8 - d % 8) % 8
 
 
-def popcount64(x: np.ndarray) -> np.ndarray:
-    x = x - ((x >> 1) & _M1)
-    x = (x & _M2) + ((x >> 2) & _M2)
-    x = (x + (x >> 4)) & _M4
-    return ((x * _H01) >> 56).astype(np.int32)
-
-
 def score64(dp, dn, qp, qn) -> np.ndarray:
     if qp.ndim == 1:
         qp, qn = qp[None, :], qn[None, :]
+    agree = np.bitwise_count((dp & qp) | (dn & qn)).sum(1, dtype=np.int32)
+    disag = np.bitwise_count((dp & qn) | (dn & qp)).sum(1, dtype=np.int32)
+    return (agree - disag).astype(np.float32)
+
+
+def score64_partitioned(
+    dp,
+    dn,
+    qp,
+    qn,
+    uni_mask,
+    ngram_mask,
+    doc_lit_uni,
+    q_lit_uni,
+    doc_lit_ngram,
+    q_lit_ngram,
+    alpha,
+) -> np.ndarray:
+    """Region-separated scoring with independent normalization."""
+    if qp.ndim == 1:
+        qp, qn = qp[None, :], qn[None, :]
     agree = (dp & qp) | (dn & qn)
-    disagree = (dp & qn) | (dn & qp)
-    return (popcount64(agree).sum(1) - popcount64(disagree).sum(1)).astype(np.float32)
+    disag = (dp & qn) | (dn & qp)
 
+    ua = np.bitwise_count(agree & uni_mask).sum(1, dtype=np.int32).astype(np.float32)
+    ud = np.bitwise_count(disag & uni_mask).sum(1, dtype=np.int32).astype(np.float32)
+    uni = (ua - ud) / np.sqrt(doc_lit_uni * q_lit_uni).clip(1.0)
 
-def bind_ternary_bits(ap: np.ndarray, an: np.ndarray, bp: np.ndarray, bn: np.ndarray):
-    """Ternary multiply in packed bitspace: (+)(+)→+, (+)(-)→-, (0)(x)→0."""
-    return (ap & bp) | (an & bn), (ap & bn) | (an & bp)
+    na = np.bitwise_count(agree & ngram_mask).sum(1, dtype=np.int32).astype(np.float32)
+    nd = np.bitwise_count(disag & ngram_mask).sum(1, dtype=np.int32).astype(np.float32)
+    ngram = (na - nd) / np.sqrt(doc_lit_ngram * q_lit_ngram).clip(1.0)
 
-
-def bind_ternary_bits_into(
-    ap: np.ndarray,
-    an: np.ndarray,
-    bp: np.ndarray,
-    bn: np.ndarray,
-    outp: np.ndarray,
-    outn: np.ndarray,
-    tmp: np.ndarray,
-) -> None:
-    """In-place ternary multiply in packed bitspace to avoid allocation."""
-    np.bitwise_and(ap, bp, out=outp)
-    np.bitwise_and(an, bn, out=tmp)
-    np.bitwise_or(outp, tmp, out=outp)
-
-    np.bitwise_and(ap, bn, out=outn)
-    np.bitwise_and(an, bp, out=tmp)
-    np.bitwise_or(outn, tmp, out=outn)
-
-
-def align8(n: int) -> int:
-    return (n + 7) & ~7
+    return alpha * uni + (1.0 - alpha) * ngram
 
 
 def mask64_for_dims(dims: int, stride_bytes: int) -> np.ndarray:
     n_words = stride_bytes // 8
-    m = np.full((n_words,), np.uint64(0xFFFFFFFFFFFFFFFF), dtype=np.uint64)
+    m = np.full(n_words, np.uint64(0xFFFFFFFFFFFFFFFF), dtype=np.uint64)
     pad_bits = n_words * 64 - dims
     if pad_bits > 0:
         keep = 64 - pad_bits
@@ -125,34 +141,34 @@ def mask64_for_dims(dims: int, stride_bytes: int) -> np.ndarray:
     return m[None, :]
 
 
-def adaptive_threshold(vals: torch.Tensor) -> float:
-    n = vals.numel()
+def _region_mask_u64(start: int, end: int, total: int, stride: int) -> np.ndarray:
+    """Packed uint64 bit mask with bits [start, end) set."""
+    bits = np.zeros(total, dtype=np.uint8)
+    bits[start:end] = 1
+    packed = np.packbits(bits)
+    pad = stride - len(packed)
+    if pad > 0:
+        packed = np.pad(packed, (0, pad))
+    return packed.view(np.uint64)[None, :]
+
+
+def adaptive_threshold(vals: np.ndarray) -> float:
+    n = len(vals)
     if n < 4:
-        return vals.max().item() if n > 0 else 0.0
-    x = vals.sort()[0]
+        return float(vals.max()) if n > 0 else 0.0
+    x = np.sort(vals)
     m = n // 2
-    median = (x[m - 1] + x[m]) / 2
-    idx = torch.arange(m, device=x.device, dtype=x.dtype)
-    L2 = 2 * (x[:m] * idx).sum() / (m * (m - 1)) - x[:m].mean()
-    return (median + L2 * math.log(n)).item() if L2 > 1e-9 else median.item()
+    median = (x[m - 1] + x[m]) * 0.5
+    lower = x[:m]
+    L2 = 2.0 * np.dot(lower, np.arange(m)) / (m * (m - 1)) - lower.mean()
+    return (median + L2 * math.log(n)) if L2 > 1e-9 else median
 
 
-def compress_context(text: str) -> str:
-    if not text:
-        return text
-    words = text.split()
-    if not words:
-        return text
-    freq = Counter(words)
-    imp = {w: 1 / n for w, n in freq.items()}
-    thr = statistics.median(imp.values())
-    return " ".join(w for w in words if imp[w] >= thr)
+def strip_structural_keys(text: str) -> str:
+    return _STRUCTURAL_PREFIX_RE.sub("", text)
 
 
-# ── Data Utilities ─────────────────────────────────────────────────
-
-
-def chunks(xs: list, n: int) -> Generator[list, None, None]:
+def _chunks(xs: list, n: int) -> Generator[list, None, None]:
     for i in range(0, len(xs), n):
         yield xs[i : i + n]
 
@@ -164,9 +180,12 @@ def extract_text(item: dict) -> str:
             rk = m.get(role_key, m.get("role", ""))
             if rk == "system":
                 continue
-            out.append(m.get(text_key or "value", m.get("content", "")))
-        return "\n\n".join(x for x in out if x)
+            text = m.get(text_key or "value", m.get("content", ""))
+            if text:
+                out.append(f"{rk}: {text}" if rk else text)
+        return "\n\n".join(out)
 
+    # Direct conversation list
     if (
         isinstance(item, list)
         and item
@@ -180,35 +199,18 @@ def extract_text(item: dict) -> str:
     if "messages" in item:
         return _join(item["messages"], role_key="role", text_key="content")
 
-    human = [
-        "human",
-        "user",
-        "prompt",
-        "problem",
-        "question",
-        "instruction",
-        "message_1",
-    ]
-    assist = [
-        "gpt",
-        "assistant",
-        "response",
-        "answer",
-        "output",
-        "message_2",
-    ]
     parts = []
-    for k in human:
+    for k in _HUMAN_KEYS:
         if item.get(k):
-            parts.append(item[k])
+            parts.append(f"{k}: {item[k]}")
             break
-    for k in assist:
+    for k in _ASSIST_KEYS:
         if item.get(k):
-            parts.append(item[k])
+            parts.append(f"{k}: {item[k]}")
             break
     if parts:
         if item.get("input"):
-            parts.insert(1, item["input"])
+            parts.insert(1, f"input: {item['input']}")
         return "\n\n".join(parts)
     return item.get("text", item.get("content", ""))
 
@@ -230,6 +232,66 @@ def discover_datasets(directory: Path) -> list:
     ]
 
 
+def _chunk_text(text: str, chunk_size: int, tokenizer) -> list[str]:
+    paras = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paras:
+        return [text] if text.strip() else []
+
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_tokens = 0
+
+    def _flush():
+        nonlocal buf, buf_tokens
+        if buf:
+            chunks.append("\n\n".join(buf))
+            buf, buf_tokens = [], 0
+
+    def _split_long(block: str):
+        nonlocal buf, buf_tokens
+        words, wbuf, wcount = block.split(), [], 0
+        for word in words:
+            wn = tokenizer.count_tokens(word)
+            if wcount + wn <= chunk_size:
+                wbuf.append(word)
+                wcount += wn
+            else:
+                if wbuf:
+                    chunks.append(" ".join(wbuf))
+                wbuf, wcount = [word], wn
+        if wbuf:
+            chunks.append(" ".join(wbuf))
+        buf, buf_tokens = [], 0
+
+    for para in paras:
+        n = tokenizer.count_tokens(para)
+        if buf_tokens + n <= chunk_size:
+            buf.append(para)
+            buf_tokens += n
+            continue
+        _flush()
+        if n <= chunk_size:
+            buf, buf_tokens = [para], n
+        else:
+            for sent in re.split(r"(?<=[.!?])\s+", para):
+                sn = tokenizer.count_tokens(sent)
+                if buf_tokens + sn <= chunk_size:
+                    buf.append(sent)
+                    buf_tokens += sn
+                elif sn <= chunk_size:
+                    if buf:
+                        chunks.append(" ".join(buf))
+                        buf, buf_tokens = [], 0
+                    buf, buf_tokens = [sent], sn
+                else:
+                    if buf:
+                        chunks.append(" ".join(buf))
+                        buf, buf_tokens = [], 0
+                    _split_long(sent)
+    _flush()
+    return chunks
+
+
 def iter_dataset(
     path: Path,
     tokenizer: Tokenizer = None,
@@ -238,27 +300,34 @@ def iter_dataset(
     if path.suffix in (".txt", ".md", ".html", ".xml"):
         text = path.read_text(encoding="utf-8")
         if tokenizer and chunk_size:
-            tokens = tokenizer.tokenize(text)
-            overlap = max(64, chunk_size // 8)
-            step = chunk_size - overlap
-            total = (len(tokens) + step - 1) // step
-            for i, start in enumerate(range(0, len(tokens), step)):
-                chunk = tokens[start : start + chunk_size]
-                if len(chunk) < overlap and i > 0:
-                    break
-                yield {
-                    "text": tokenizer.detokenize(chunk),
-                    "chunk_idx": i,
-                    "total_chunks": total,
-                }
+            parts = _chunk_text(text, chunk_size, tokenizer)
+            for i, part in enumerate(parts):
+                yield {"text": part, "chunk_idx": i, "total_chunks": len(parts)}
         else:
             yield {"text": text}
     elif path.suffix == ".parquet":
-        for rec in pd.read_parquet(path).to_dict(orient="records"):
-            yield {
-                k: v.tolist() if isinstance(v, np.ndarray) else v
-                for k, v in rec.items()
-            }
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(path)
+        try:
+            pf.read_row_group(0).to_pylist()
+            use_row_groups = True
+        except Exception:
+            use_row_groups = False
+
+        if use_row_groups:
+            for i in range(pf.metadata.num_row_groups):
+                yield from pf.read_row_group(i).to_pylist()
+        else:
+            schema = pf.schema_arrow
+            flat_cols = [
+                f.name
+                for f in schema
+                if str(f.type).startswith(
+                    ("string", "utf8", "large_string", "int", "float", "double", "bool")
+                )
+            ] or None
+            yield from pq.read_table(path, columns=flat_cols).to_pylist()
     elif path.suffix == ".jsonl":
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -272,14 +341,230 @@ def iter_dataset(
         raise ValueError(f"Unsupported format: {path.suffix}")
 
 
-# ── Database ───────────────────────────────────────────────────────
+_trim_log = logging.getLogger(__name__ + ".trim")
+
+
+def _linux_malloc_trim():
+    """Release free heap pages back to the OS on Linux."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6", use_errno=True).malloc_trim(0)
+    except Exception:
+        pass
+
+
+class _WinMemHelper:
+    """Lazy-initialized Windows memory management via ctypes."""
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+        # kernel32 prototypes
+        k32.GetCurrentProcess.argtypes = []
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.SetProcessWorkingSetSizeEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            wintypes.DWORD,
+        ]
+        k32.SetProcessWorkingSetSizeEx.restype = wintypes.BOOL
+
+        # psapi
+        psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+        psapi.EmptyWorkingSet.restype = wintypes.BOOL
+
+        self.k32 = k32
+        self.psapi = psapi
+
+    @classmethod
+    def get(cls) -> Optional["_WinMemHelper"]:
+        if os.name != "nt":
+            return None
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    try:
+                        cls._instance = cls()
+                    except Exception:
+                        return None
+        return cls._instance
+
+    def trim_working_set(self, *handles):
+        for h in handles:
+            self.psapi.EmptyWorkingSet(h)
+
+    def current_process(self):
+        return self.k32.GetCurrentProcess()
+
+    def open_child(self, pid: int):
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_QUERY_INFORMATION = 0x0400
+        return self.k32.OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, False, pid
+        )
+
+    def purge_standby_list(self):
+        """Purge the system standby page list (requires SeProfileSingleProcessPrivilege)."""
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+
+        SE_PRIVILEGE_ENABLED = 0x00000002
+        TOKEN_ADJUST_PRIVILEGES = 0x0020
+        TOKEN_QUERY = 0x0008
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+        class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+        class TOKEN_PRIVILEGES(ctypes.Structure):
+            _fields_ = [
+                ("PrivilegeCount", wintypes.DWORD),
+                ("Privileges", LUID_AND_ATTRIBUTES * 1),
+            ]
+
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.LookupPrivilegeValueW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(LUID),
+        ]
+        advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+        advapi32.AdjustTokenPrivileges.argtypes = [
+            wintypes.HANDLE,
+            wintypes.BOOL,
+            ctypes.POINTER(TOKEN_PRIVILEGES),
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+        ntdll.NtSetSystemInformation.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        ntdll.NtSetSystemInformation.restype = ctypes.c_long
+
+        hToken = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            self.current_process(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            ctypes.byref(hToken),
+        ):
+            return
+
+        try:
+            luid = LUID()
+            if not advapi32.LookupPrivilegeValueW(
+                None, "SeProfileSingleProcessPrivilege", ctypes.byref(luid)
+            ):
+                return
+            tp = TOKEN_PRIVILEGES()
+            tp.PrivilegeCount = 1
+            tp.Privileges[0].Luid = luid
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+            advapi32.AdjustTokenPrivileges(
+                hToken,
+                False,
+                ctypes.byref(tp),
+                ctypes.sizeof(tp),
+                None,
+                None,
+            )
+            if ctypes.get_last_error() == 1300:
+                return
+        finally:
+            self.k32.CloseHandle(hToken)
+
+
+def soft_trim():
+    """Move faulted mmap pages from working set to standby."""
+    gc.collect()
+    if os.name != "nt":
+        _linux_malloc_trim()
+        return
+    try:
+        wm = _WinMemHelper.get()
+        if wm:
+            wm.trim_working_set(wm.current_process())
+    except Exception as exc:
+        _trim_log.info("soft_trim error: %s", exc)
+
+
+def trim_memory(*child_procs):
+    """Release unused memory (VRAM, Python GC, OS pages)."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    gc.collect()
+
+    if os.name != "nt":
+        _linux_malloc_trim()
+        return
+
+    try:
+        wm = _WinMemHelper.get()
+        if not wm:
+            return
+        handles_to_close = []
+        handles = [wm.current_process()]
+
+        for proc in child_procs:
+            if proc is None or proc.poll() is not None:
+                continue
+            try:
+                h = wm.open_child(proc.pid)
+                if h:
+                    handles.append(h)
+                    handles_to_close.append(h)
+            except Exception:
+                pass
+
+        wm.trim_working_set(*handles)
+        for h in handles_to_close:
+            wm.k32.CloseHandle(h)
+        wm.purge_standby_list()
+
+    except Exception as exc:
+        _trim_log.info("trim_memory Windows error: %s", exc)
 
 
 class Database:
     SCHEMA = """
         CREATE TABLE IF NOT EXISTS memories (
             hdv_idx INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL,
-            text TEXT NOT NULL, metadata JSON, token_count INTEGER);
+            text BLOB NOT NULL, metadata JSON, token_count INTEGER,
+            uni_lit INTEGER);
         CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS idf (
             token_id INTEGER PRIMARY KEY, doc_freq INTEGER NOT NULL,
@@ -290,15 +575,43 @@ class Database:
     def __init__(self, db_path: Path, config: Config, logger=None):
         self.db_path = db_path
         self.config = config
-        self.corpus_file = db_path.parent / "corpus_hdc.idx"
-        self.vocab_file = db_path.parent / "vocab_hdc.idx"
         self.logger = logger
         self._stride = bstride(config.hdc_dimensions)
+        self._lock = threading.Lock()
+
+        # Sidecar file paths
+        parent = db_path.parent
+        self.corpus_file = parent / "corpus_hdc.idx"
+        self.vocab_file = parent / "vocab_hdc.idx"
+        self.lit_file = parent / "lit.idx"
+        self.uni_lit_file = parent / "uni_lit.idx"
+        self.ngram_lit_file = parent / "ngram_lit.idx"
+
+        # Mmap state
+        self._corpus_cache = None
+        self._mmap_raw = None
+        self._mmap_lit = None
+        self._mmap_uni_lit = None
+        self._mmap_ngram_lit = None
+        self._count: int | None = None
+
+        self._db = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        for pragma in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            f"PRAGMA cache_size=-{self.config.sqlite_cache_kb}",
+            "PRAGMA temp_store=MEMORY",
+        ):
+            self._db.execute(pragma)
         self._init_db()
 
     def _init_db(self):
         with self._conn() as c:
             c.executescript(self.SCHEMA)
+            cols = {r[1] for r in c.execute("PRAGMA table_info(memories)")}
+            if "uni_lit" not in cols:
+                c.execute("ALTER TABLE memories ADD COLUMN uni_lit INTEGER")
             row = c.execute(
                 "SELECT value FROM config WHERE key='hdc_dimensions'"
             ).fetchone()
@@ -313,23 +626,13 @@ class Database:
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
-        c = sqlite3.connect(self.db_path, check_same_thread=False)
-        c.row_factory = sqlite3.Row
-        for pragma in (
-            "PRAGMA journal_mode=WAL",
-            "PRAGMA synchronous=NORMAL",
-            f"PRAGMA cache_size=-{self.config.sqlite_cache_kb}",
-            "PRAGMA temp_store=MEMORY",
-        ):
-            c.execute(pragma)
-        try:
-            yield c
-            c.commit()
-        except:
-            c.rollback()
-            raise
-        finally:
-            c.close()
+        with self._lock:
+            try:
+                yield self._db
+                self._db.commit()
+            except:
+                self._db.rollback()
+                raise
 
     def _query(self, sql, params=()):
         with self._conn() as c:
@@ -337,35 +640,170 @@ class Database:
 
     def _chunked(self, sql, ids, extract):
         result = {}
-        for chunk in chunks(ids, self.config.sqlite_max_vars):
-            ph = ",".join("?" * len(chunk))
-            for row in self._query(sql.format(ph), tuple(chunk)):
-                k, v = extract(row)
-                result[k] = v
+        with self._conn() as c:
+            for chunk in _chunks(ids, self.config.sqlite_max_vars):
+                ph = ",".join("?" * len(chunk))
+                for row in c.execute(sql.format(ph), tuple(chunk)).fetchall():
+                    k, v = extract(row)
+                    result[k] = v
         return result
 
+    def _load_sidecar(
+        self, path: Path, n: int, dtype=np.float32
+    ) -> Optional[np.ndarray]:
+        """Load a sidecar file via mmap if it exists and has the right size."""
+        expected = n * np.dtype(dtype).itemsize
+        if path.exists() and path.stat().st_size == expected:
+            return np.memmap(path, dtype=dtype, mode="r", shape=(n,))
+        return None
+
+    def _ensure_sidecar(
+        self,
+        path: Path,
+        cache_attr: str,
+        n: int,
+        generate_fn: Callable[[], np.ndarray],
+    ) -> np.ndarray:
+        """Generic sidecar accessor: return cached mmap, or load from disk, or generate."""
+        cached = getattr(self, cache_attr)
+        if cached is not None:
+            return cached
+
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        # Try loading existing file
+        loaded = self._load_sidecar(path, n)
+        if loaded is not None:
+            setattr(self, cache_attr, loaded)
+            return loaded
+
+        # Generate, save, and mmap
+        arr = generate_fn()
+        if arr is not None:
+            arr.tofile(path)
+            del arr
+            loaded = self._load_sidecar(path, n)
+            if loaded is not None:
+                setattr(self, cache_attr, loaded)
+                return loaded
+
+        return np.zeros(n, dtype=np.float32)
+
+    def _convert_interleaved_to_blocked(self, n: int):
+        """Reorganize interleaved [pos|neg, pos|neg, ...] → blocked [pos..., neg...]."""
+        d = self._stride
+        if (
+            self.get_config("corpus_layout") == "blocked"
+            or not self.corpus_file.exists()
+            or self.corpus_file.stat().st_size != n * d * 2
+        ):
+            return
+        tmp = self.corpus_file.with_suffix(".tmp")
+        with open(self.corpus_file, "rb") as src, open(tmp, "wb") as dst:
+            for i in range(n):
+                src.seek(i * d * 2)
+                dst.write(src.read(d))
+            for i in range(n):
+                src.seek(i * d * 2 + d)
+                dst.write(src.read(d))
+        tmp.replace(self.corpus_file)
+        self.set_config("corpus_layout", "blocked")
+
     def _open_corpus(self):
+        if self._corpus_cache is not None:
+            return self._corpus_cache
         if not self.corpus_file.exists():
             return None
         n = self.count()
         if n == 0:
             return None
-        data = np.memmap(self.corpus_file, dtype=np.uint8, mode="r")
-        layout = self.get_config("corpus_layout") or "interleaved"
-        if layout == "blocked":
-            half = n * self._stride
-            return (
-                data,
-                data[:half].reshape(n, self._stride),
-                data[half:].reshape(n, self._stride),
+
+        d = self._stride
+        self._convert_interleaved_to_blocked(n)
+
+        raw = np.memmap(self.corpus_file, dtype=np.uint8, mode="r")
+        self._mmap_raw = raw
+        half = n * d
+        pos, neg = raw[:half].reshape(n, d), raw[half : 2 * half].reshape(n, d)
+        pos64, neg64 = pos.view(np.uint64), neg.view(np.uint64)
+
+        # Ensure lit sidecar exists, then mmap it
+        expected = n * np.dtype(np.float32).itemsize
+        if not self.lit_file.exists() or self.lit_file.stat().st_size != expected:
+            tmp_lit = np.bitwise_count(pos64 | neg64).sum(axis=1, dtype=np.float32)
+            tmp_lit.tofile(self.lit_file)
+            del tmp_lit
+        self._mmap_lit = self._load_sidecar(self.lit_file, n)
+        lit = self._mmap_lit
+
+        # Open sidecar mmaps for uni/ngram lit if they exist
+        self._mmap_uni_lit = self._load_sidecar(self.uni_lit_file, n)
+        self._mmap_ngram_lit = self._load_sidecar(self.ngram_lit_file, n)
+
+        self._corpus_cache = (pos, neg, pos64, neg64, lit)
+        if self.logger:
+            mb = self.corpus_file.stat().st_size / 1e6
+            self.logger.info(f"Corpus mmap: {mb:.0f}MB, {n:,} vectors")
+        return self._corpus_cache
+
+    def invalidate_corpus(self):
+        self._corpus_cache = None
+        self._mmap_raw = self._mmap_lit = self._mmap_uni_lit = self._mmap_ngram_lit = (
+            None
+        )
+
+    def release_mmap_pages(self):
+        """Close all mmap file handles so the OS can reclaim physical pages."""
+        self.invalidate_corpus()
+        gc.collect()
+
+    def _get_lit_uni(self) -> np.ndarray:
+        """Unigram-only lit counts via mmap sidecar."""
+        n = self.count()
+
+        def _generate():
+            tmp = np.zeros(n, dtype=np.float32)
+            populated = False
+            try:
+                for r in self._query(
+                    "SELECT hdv_idx, uni_lit FROM memories WHERE uni_lit IS NOT NULL"
+                ):
+                    tmp[r["hdv_idx"]] = float(r["uni_lit"])
+                    populated = True
+            except Exception:
+                pass
+            if not populated:
+                corpus = self._open_corpus()
+                if corpus:
+                    np.copyto(tmp, corpus[4][:n])
+            return tmp
+
+        return self._ensure_sidecar(self.uni_lit_file, "_mmap_uni_lit", n, _generate)
+
+    def _get_lit_ngram(self, ngram_mask=None) -> np.ndarray:
+        """N-gram region lit counts via mmap sidecar."""
+        n = self.count()
+
+        def _generate():
+            if ngram_mask is None:
+                return None
+            corpus = self._open_corpus()
+            if not corpus:
+                return None
+            _, _, pos64, neg64, _ = corpus
+            return np.bitwise_count((pos64 | neg64) & ngram_mask).sum(
+                axis=1, dtype=np.float32
             )
-        else:
-            d = self._stride
-            view = data.reshape(n, d * 2)
-            return data, view[:, :d], view[:, d:]
+
+        return self._ensure_sidecar(
+            self.ngram_lit_file, "_mmap_ngram_lit", n, _generate
+        )
 
     def count(self) -> int:
-        return self._query("SELECT COUNT(*) FROM memories")[0][0]
+        if self._count is None:
+            self._count = self._query("SELECT COUNT(*) FROM memories")[0][0]
+        return self._count
 
     def exists(self, ids: list[str]) -> set[str]:
         if not ids:
@@ -382,14 +820,13 @@ class Database:
         if not indices:
             return {}
         return self._chunked(
-            "SELECT hdv_idx, id, text, metadata, token_count "
-            "FROM memories WHERE hdv_idx IN ({})",
+            "SELECT hdv_idx, id, text, metadata, token_count FROM memories WHERE hdv_idx IN ({})",
             indices,
             lambda r: (
                 r["hdv_idx"],
                 {
                     "id": r["id"],
-                    "text": r["text"],
+                    "text": zlib.decompress(r["text"]).decode(),
                     "hdv_idx": r["hdv_idx"],
                     "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                     "token_count": r["token_count"],
@@ -404,16 +841,38 @@ class Database:
             counts[r["hdv_idx"]] = r["token_count"] or 1
         return counts
 
+    def get_source_map(self) -> dict[int, str]:
+        return {
+            r[0]: r[1] or ""
+            for r in self._query(
+                "SELECT hdv_idx, json_extract(metadata,'$.source') FROM memories"
+            )
+        }
+
     def get_bitmaps(self, indices: list[int]) -> tuple[np.ndarray, np.ndarray]:
         corpus = self._open_corpus()
         if not corpus or not indices:
             d = self._stride
             return np.empty((0, d), np.uint8), np.empty((0, d), np.uint8)
-        _, pos, neg = corpus
+        pos, neg, _, _, _ = corpus
         idx = np.array(indices)
-        result = pos[idx].copy(), neg[idx].copy()
-        del corpus
-        return result
+        return np.ascontiguousarray(pos[idx]), np.ascontiguousarray(neg[idx])
+
+    def get_search_arrays(
+        self, indices: list[int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        corpus = self._open_corpus()
+        if not corpus or not indices:
+            cols = self._stride // 8
+            e = np.empty((0, cols), np.uint64)
+            return e, e, np.empty(0, np.float32)
+        _, _, pos64, neg64, lit = corpus
+        idx = np.array(indices)
+        return (
+            np.ascontiguousarray(pos64[idx]),
+            np.ascontiguousarray(neg64[idx]),
+            lit[idx].copy(),
+        )
 
     def save_idf(self, df_counts: dict, n_docs: int):
         rows = [
@@ -430,6 +889,12 @@ class Database:
             for r in self._query("SELECT token_id, weight FROM idf")
         }
 
+    def load_df(self) -> dict[int, int]:
+        return {
+            r["token_id"]: r["doc_freq"]
+            for r in self._query("SELECT token_id, doc_freq FROM idf")
+        }
+
     def get_config(self, key: str):
         rows = self._query("SELECT value FROM config WHERE key=?", (key,))
         if not rows:
@@ -442,130 +907,197 @@ class Database:
     def set_config(self, key: str, value: Any):
         with self._conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO config VALUES (?,?)",
-                (key, json.dumps(value)),
+                "INSERT OR REPLACE INTO config VALUES (?,?)", (key, json.dumps(value))
             )
+
+    def _insert_memory_rows(self, c, items, hdv_start, lit_uni):
+        """Shared row insertion used by both insert() and insert_rows()."""
+        c.executemany(
+            "INSERT INTO memories (hdv_idx,id,text,metadata,token_count,uni_lit) VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    hdv_start + i,
+                    it["id"],
+                    zlib.compress(it["text"].encode(), 1),
+                    json.dumps(it["metadata"]),
+                    it["token_count"],
+                    int(lit_uni[i]) if lit_uni is not None else None,
+                )
+                for i, it in enumerate(items)
+            ],
+        )
 
     def insert(self, items: list[dict], bitmaps: dict[str, np.ndarray]):
         pos, neg = bitmaps["pos"], bitmaps["neg"]
+        lit_uni = bitmaps.get("lit_uni")
         with self._conn() as c:
             start = c.execute(
                 "SELECT COALESCE(MAX(hdv_idx),-1)+1 FROM memories"
             ).fetchone()[0]
-            c.executemany(
-                "INSERT INTO memories "
-                "(hdv_idx,id,text,metadata,token_count) VALUES (?,?,?,?,?)",
-                [
-                    (
-                        start + i,
-                        it["id"],
-                        it["text"],
-                        json.dumps(it["metadata"]),
-                        it["token_count"],
-                    )
-                    for i, it in enumerate(items)
-                ],
-            )
+            self._insert_memory_rows(c, items, start, lit_uni)
         with open(self.corpus_file, "ab") as f:
             for i in range(len(pos)):
                 f.write(pos[i].tobytes())
                 f.write(neg[i].tobytes())
         self.set_config("corpus_layout", "interleaved")
+        self.invalidate_corpus()
+        self._count = None
+
+    def insert_rows(self, items: list[dict], bitmaps: dict, hdv_start: int):
+        """Insert metadata rows into SQLite (no corpus file I/O)."""
+        with self._conn() as c:
+            self._insert_memory_rows(c, items, hdv_start, bitmaps.get("lit_uni"))
+        self._count = None
 
     def finalize_index(self):
         n = self.count()
         if n == 0:
             return
-        layout = self.get_config("corpus_layout")
-        if layout == "blocked":
-            return
-        d = self._stride
-        if (
-            not self.corpus_file.exists()
-            or self.corpus_file.stat().st_size != n * d * 2
-        ):
-            return
-        if self.logger:
-            self.logger.info(f"Reorganizing {n:,} HDVs to blocked layout")
-        tmp = self.corpus_file.with_suffix(".tmp")
-        with open(self.corpus_file, "rb") as src, open(tmp, "wb") as dst:
-            for i in range(n):
-                src.seek(i * d * 2)
-                dst.write(src.read(d))
-            for i in range(n):
-                src.seek(i * d * 2 + d)
-                dst.write(src.read(d))
-        tmp.replace(self.corpus_file)
-        self.set_config("corpus_layout", "blocked")
 
-    def search(self, q_pos, q_neg, target, candidates=None, logger=None):
+        self._convert_interleaved_to_blocked(n)
+        self.invalidate_corpus()
+
+        # Generate missing sidecar files
+        if self.corpus_file.exists() and not self.lit_file.exists():
+            corpus = self._open_corpus()
+            if corpus:
+                arr = np.bitwise_count(corpus[2] | corpus[3]).sum(
+                    axis=1, dtype=np.float32
+                )
+                arr.tofile(self.lit_file)
+                del arr
+                self.invalidate_corpus()
+
+        if self.corpus_file.exists() and not self.uni_lit_file.exists():
+            uni_lits = np.zeros(n, dtype=np.float32)
+            populated = False
+            try:
+                for r in self._query(
+                    "SELECT hdv_idx, uni_lit FROM memories WHERE uni_lit IS NOT NULL"
+                ):
+                    uni_lits[r["hdv_idx"]] = float(r["uni_lit"])
+                    populated = True
+            except Exception:
+                pass
+            if populated:
+                uni_lits.tofile(self.uni_lit_file)
+
+        with self._conn() as c:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c.execute("PRAGMA journal_mode=DELETE")
+
+        # Force WAL/SHM removal
+        self._db.close()
+        for f in (self.db_path.with_suffix(".db-wal"), self.db_path.with_suffix(".db-shm")):
+            if f.exists():
+                f.unlink()
+        trim_memory()
+    
+        # Reopen in WAL for query-time reads
+        self._db = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        for pragma in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            f"PRAGMA cache_size=-{self.config.sqlite_cache_kb}",
+            "PRAGMA temp_store=MEMORY",
+        ):
+            self._db.execute(pragma)
+        self._count = None
+
+    def search(
+        self,
+        q_pos,
+        q_neg,
+        target,
+        candidates=None,
+        logger=None,
+        q_lit_uni: float = None,
+        q_lit_ngram: float = None,
+        uni_mask=None,
+        ngram_mask=None,
+        alpha: float = None,
+    ):
+        """Progressive pruning in geometric-mean-normalized HDC space."""
         corpus = self._open_corpus()
         if not corpus:
             return np.array([], np.int32), np.array([], np.float32)
-        data, pos_map, neg_map = corpus
-        n = pos_map.shape[0]
+        _, _, pos64, neg64, lit = corpus
+        n = pos64.shape[0]
 
         corpus_idx = candidates if candidates is not None else np.arange(n)
         nc = len(corpus_idx)
         if nc == 0:
-            del data
             return np.array([], np.int32), np.array([], np.float32)
 
-        pos_64, neg_64 = pos_map.view(np.uint64), neg_map.view(np.uint64)
         qp64 = q_pos.ravel().view(np.uint64)
         qn64 = q_neg.ravel().view(np.uint64)
-        n_cols = pos_64.shape[1]
+        q_lit = float(np.bitwise_count(qp64 | qn64).sum(dtype=np.int32))
+        n_cols = pos64.shape[1]
 
         max_passes = max(2, int(np.ceil(np.log2(nc / target)))) if nc > target else 1
-        chunk_sz = max(1, n_cols // max_passes)
+
+        # Geometric column schedule: early passes (large candidate set) use
+        # fewer columns for cheap coarse ranking; later passes (small set)
+        # use more columns for finer discrimination.  Total columns = n_cols.
+        # With ratio 2, widths double each pass → work per pass ≈ constant.
+        if max_passes <= 1:
+            col_slices = [(0, n_cols)]
+        else:
+            base = n_cols / (2.0**max_passes - 1)
+            widths = [max(1, int(round(base * 2.0**i))) for i in range(max_passes)]
+            widths[-1] = n_cols - sum(widths[:-1])
+            col_slices = []
+            pos = 0
+            for w in widths:
+                col_slices.append((pos, min(pos + w, n_cols)))
+                pos += w
+
         cumul = np.zeros(nc, np.float32)
         surv = np.arange(nc)
-        prev_top = None
-        buf_p = buf_n = None
 
-        for i in range(max_passes):
-            s = i * chunk_sz
-            e = n_cols if i == max_passes - 1 else (i + 1) * chunk_sz
+        for s, e in col_slices:
             cs = corpus_idx[surv]
-
-            if i == 1:
-                buf_p = np.ascontiguousarray(pos_64[cs])
-                buf_n = np.ascontiguousarray(neg_64[cs])
-
-            if i >= 1:
-                cumul[surv] += score64(
-                    buf_p[:, s:e], buf_n[:, s:e], qp64[s:e], qn64[s:e]
-                )
-            else:
-                cumul[surv] += score64(
-                    pos_64[cs, s:e], neg_64[cs, s:e], qp64[s:e], qn64[s:e]
-                )
-
-            k = min(target, len(surv))
-            top_idx = np.argpartition(cumul[surv], -k)[-k:]
-            curr_top = set(surv[top_idx])
-
-            if prev_top is not None and curr_top == prev_top:
-                if logger:
-                    logger.info(
-                        f"[Prune] {nc:,}\u2192{len(surv):,} stable@{i + 1}/{max_passes}"
-                    )
-                break
-            prev_top = curr_top
+            cumul[surv] += score64(pos64[cs, s:e], neg64[cs, s:e], qp64[s:e], qn64[s:e])
 
             if len(surv) > target:
                 keep = max(target, len(surv) // 2)
-                idx = np.argpartition(cumul[surv], -keep)[-keep:]
-                surv = surv[idx]
-                if i >= 1:
-                    buf_p, buf_n = buf_p[idx], buf_n[idx]
-        else:
-            if logger:
-                logger.info(f"[Prune] {nc:,}\u2192{len(surv):,} floor@{max_passes}")
+                surv = surv[np.argpartition(cumul[surv], -keep)[-keep:]]
 
-        scores = cumul[surv]
+        if logger:
+            logger.info(f"[Prune] {nc:,}→{len(surv):,} passes: {max_passes}")
+
+        # Final scoring on survivors only
+        cs_final = corpus_idx[surv]
+
+        use_partitioned = (
+            uni_mask is not None
+            and ngram_mask is not None
+            and alpha is not None
+            and q_lit_ngram is not None
+        )
+
+        if use_partitioned:
+            scores = score64_partitioned(
+                pos64[cs_final],
+                neg64[cs_final],
+                qp64,
+                qn64,
+                uni_mask,
+                ngram_mask,
+                self._get_lit_uni()[cs_final],
+                q_lit_uni,
+                self._get_lit_ngram(ngram_mask=ngram_mask)[cs_final],
+                q_lit_ngram,
+                alpha,
+            )
+        else:
+            lit_uni = self._get_lit_uni()
+            doc_denom = lit_uni[cs_final] if len(lit_uni) > 0 else lit[cs_final]
+            q_denom = q_lit_uni if q_lit_uni is not None else q_lit
+            scores = cumul[surv] / np.sqrt(doc_denom * q_denom).clip(1.0)
+
         order = np.argsort(-scores)
-        del data
         return corpus_idx[surv[order]], scores[order]
 
     def clear(self):
@@ -573,8 +1105,27 @@ class Database:
             c.execute("DELETE FROM memories")
             c.execute("DELETE FROM idf")
             c.execute("DELETE FROM config WHERE key != 'hdc_dimensions'")
-        if self.corpus_file.exists():
-            self.corpus_file.unlink()
+        self.invalidate_corpus()
+        trim_memory()
+        for f in (
+            self.corpus_file,
+            self.lit_file,
+            self.uni_lit_file,
+            self.ngram_lit_file,
+        ):
+            if f.exists():
+                f.unlink()
+        self._count = None
+        trim_memory()
+
+    def close(self):
+        self.invalidate_corpus()
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None
 
     def stats(self) -> dict:
         return {
@@ -582,6 +1133,8 @@ class Database:
             "corpus_hdv_mb": self.corpus_file.stat().st_size / 1e6
             if self.corpus_file.exists()
             else 0,
+            "corpus_resident": self._corpus_cache is not None,
+            "corpus_mmap": self._mmap_raw is not None,
         }
 
     def source_counts(self) -> dict:
@@ -597,575 +1150,494 @@ class Database:
         corpus = self._open_corpus()
         if not corpus:
             return {"positive": 0, "negative": 0, "zero": 1}
-        data, pos, neg = corpus
-        dims = self.config.hdc_dimensions
-        pu = np.unpackbits(pos, axis=1)[:, :dims]
-        nu = np.unpackbits(neg, axis=1)[:, :dims]
-        total = pu.size
-        result = {
-            "positive": float(pu.sum() / total),
-            "negative": float(nu.sum() / total),
-            "zero": float((total - (pu | nu).sum()) / total),
+        _, _, pos64, neg64, _ = corpus
+        dims, n = self.config.hdc_dimensions, pos64.shape[0]
+        total = n * dims
+        pos_bits = np.bitwise_count(pos64).sum(dtype=np.int64)
+        neg_bits = np.bitwise_count(neg64).sum(dtype=np.int64)
+        active = float(pos_bits + neg_bits)
+        return {
+            "positive": float(pos_bits / total),
+            "negative": float(neg_bits / total),
+            "zero": float((total - active) / total),
         }
-        del data
-        return result
 
     def sample_similarities(self) -> list[float]:
         corpus = self._open_corpus()
         if not corpus:
             return []
-        data, pos, neg = corpus
-        n = pos.shape[0]
+        _, _, p64, n64, _ = corpus
+        n = p64.shape[0]
         if n < 2:
-            del data
             return []
         max_pairs = n * (n - 1) // 2
         ns = min(max_pairs, int(max_pairs**0.5))
-        p64, n64 = pos.view(np.uint64), neg.view(np.uint64)
         ia = np.random.randint(0, n, ns * 2)
         ib = np.random.randint(0, n, ns * 2)
         mask = ia != ib
         ia, ib = ia[mask][:ns], ib[mask][:ns]
-        result = score64(p64[ia], n64[ia], p64[ib], n64[ib]).tolist()
-        del data
-        return result
+        return score64(p64[ia], n64[ia], p64[ib], n64[ib]).tolist()
 
     def dimension_activation(self) -> tuple[np.ndarray, np.ndarray]:
         corpus = self._open_corpus()
         if not corpus:
             return np.array([]), np.array([])
-        data, pos, neg = corpus
+        pos, neg, _, _, _ = corpus
         dims = self.config.hdc_dimensions
-        pf = np.unpackbits(pos, axis=1)[:, :dims].mean(axis=0)
-        nf = np.unpackbits(neg, axis=1)[:, :dims].mean(axis=0)
-        del data
-        return pf, nf
-
-    def close(self):
-        pass
-
-
-# ── HDC Encoder ────────────────────────────────────────────────────
+        n = pos.shape[0]
+        pf = np.zeros(dims, dtype=np.float64)
+        nf = np.zeros(dims, dtype=np.float64)
+        chunk = max(1, min(10000, 500_000_000 // dims))
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            pf += np.unpackbits(np.ascontiguousarray(pos[s:e]), axis=1)[:, :dims].sum(
+                axis=0
+            )
+            nf += np.unpackbits(np.ascontiguousarray(neg[s:e]), axis=1)[:, :dims].sum(
+                axis=0
+            )
+        pf /= n
+        nf /= n
+        return pf.astype(np.float32), nf.astype(np.float32)
 
 
 class HDCEncoder:
-    def __init__(self, config: Config, hdrag_dir: Path, db: Database):
+    """Dimension-partitioned skip-gram HDC encoder."""
+
+    def __init__(self, config: Config, hdrag_dir: Path, db):
         self.config = config
         self.hdrag_dir = hdrag_dir
         self.db = db
-        self.proj_path = hdrag_dir / "projection.pt"
         self.idf: dict[int, float] = db.load_idf()
         self.median_doc_length = db.get_config("median_doc_length") or 0.0
-        self._emb_dim = db.get_config("emb_dim") or 0
         self._stride = bstride(config.hdc_dimensions)
         self._corpus_vocab: list[int] = []
         self._remap: dict[int, int] = {}
-        self._bind_ws: Optional[dict[str, np.ndarray]] = None
-        self._bind_ws_shape = (0, 0)
-        if self.proj_path.exists():
-            tset(
-                "projection",
-                torch.load(self.proj_path, weights_only=True, map_location="cpu"),
-            )
+        self._vocab_t: Optional[torch.Tensor] = None
+
         self._build_remap()
+        self._init_hash_constants()
+        self._init_partition()
+
+    def _init_partition(self):
+        """Compute dimension partition, codeword width, and region masks."""
+        D = self.config.hdc_dimensions
+        N = self.config.hdc_ngram
+        stride = self._stride
+        D_ngram = D // 2
+        D_uni = D - D_ngram
+        P_onset = max(1, N * (N - 1) // 2)
+        C_local = math.ceil(math.log(max(D_ngram, 2)) / math.log(3))
+
+        self._base_activate = max(
+            C_local, round(math.sqrt(D_ngram * C_local / P_onset))
+        )
+        self._C_local = C_local
+        self._D_uni = D_uni
+        self._D_ngram = D_ngram
+        self._uni_mask = _region_mask_u64(0, D_uni, D, stride)
+        self._ngram_mask = _region_mask_u64(D_uni, D, D, stride)
+        self._full_mask = mask64_for_dims(D, stride)
+
+    def _init_hash_constants(self):
+        rng = np.random.default_rng(self.config.hdc_seed ^ 0x4E475241)
+        self._token_mix = np.uint64(int(rng.integers(1, 2**63, dtype=np.uint64)) | 1)
+        self._hash_a = np.uint64(int(rng.integers(1, 2**63, dtype=np.uint64)) | 1)
+        self._hash_b = np.uint64(int(rng.integers(1, 2**63, dtype=np.uint64)) | 1)
 
     def _build_remap(self):
         if self.idf:
             self._corpus_vocab = sorted(self.idf.keys())
             self._remap = {tok: i for i, tok in enumerate(self._corpus_vocab)}
-            mx = max(self._corpus_vocab) + 1
-            self._remap_arr = np.full(mx, -1, dtype=np.int32)
-            for tid, idx in self._remap.items():
-                self._remap_arr[tid] = idx
+            vocab_arr = np.array(self._corpus_vocab, dtype=np.int32)
+            if len(vocab_arr) > 0:
+                mx = int(vocab_arr.max()) + 1
+                self._remap_arr = np.full(mx, -1, dtype=np.int32)
+                self._remap_arr[vocab_arr] = np.arange(len(vocab_arr), dtype=np.int32)
+            else:
+                self._remap_arr = np.zeros(1, dtype=np.int32)
         else:
             self._corpus_vocab, self._remap = [], {}
             self._remap_arr = np.zeros(1, dtype=np.int32)
-        for a in ("_vocab_f16", "_vocab_ng_u8", "_vocab_ng64", "_vocab_bag"):
-            if hasattr(self, a):
-                delattr(self, a)
-
-    def _init_projection(self, emb_dim: int):
-        proj = tget("projection")
-        if proj is not None:
-            if proj.shape[0] != emb_dim:
-                raise ValueError(
-                    f"Projection dim mismatch: {proj.shape[0]} != {emb_dim}"
-                )
-            return proj
-        g = torch.Generator(device="cpu").manual_seed(self.config.hdc_seed)
-        proj = torch.randn(
-            emb_dim,
-            self.config.hdc_dimensions,
-            generator=g,
-            dtype=torch.float16,
-        )
-        proj /= proj.norm(dim=0, keepdim=True).clamp(min=1e-6)
-        torch.save(proj, self.proj_path)
-        return tset("projection", proj)
+        if hasattr(self, "_vocab_f16"):
+            delattr(self, "_vocab_f16")
+        self._vocab_t = None
 
     def build_vocab_index(self):
+        """Generate random HDC vectors for each token in the corpus vocabulary."""
         if self.db.vocab_file.exists():
             return
         self._build_remap()
         if not self._corpus_vocab:
             return
 
-        emb = tget("embedding_table")
-        if emb is None:
-            return
-        self._emb_dim = emb.shape[1]
-        self.db.set_config("emb_dim", self._emb_dim)
-        proj = self._init_projection(emb.shape[1])
-        n, dim = self.config.hdc_ngram, self.config.hdc_dimensions
-        stride = self._stride
-        n_words = stride // 8
-        mask64 = mask64_for_dims(dim, stride)
+        dim = self.config.hdc_dimensions
+        nv = len(self._corpus_vocab)
+        seed = np.uint64(self.config.hdc_seed)
+        base = np.empty((nv, dim), dtype=np.float32)
+        dim_idx = np.arange(dim, dtype=np.uint64)
 
-        base = (
-            emb[self._corpus_vocab].to(device="cuda", dtype=torch.float16) @ proj.cuda()
+        # Stafford variant 13 mix constants
+        MIX_A, MIX_B = np.uint64(0x9E3779B97F4A7C15), np.uint64(0x6C62272E07BB0142)
+        MIX_C = np.uint64(0xBF58476D1CE4E5B9)
+        MIX_D, MIX_E = np.uint64(0x517CC1B727220A95), np.uint64(0x94D049BB133111EB)
+        S32, S31, S11 = np.uint64(32), np.uint64(31), np.uint64(11)
+        SCALE = 1.0 / (1 << 53)
+
+        CHUNK = 512
+        for start in range(0, nv, CHUNK):
+            end = min(start + CHUNK, nv)
+            tids = np.array(self._corpus_vocab[start:end], dtype=np.uint64)[:, None]
+
+            h1 = (tids ^ seed) * MIX_A + dim_idx * MIX_B
+            h1 ^= h1 >> S32
+            h1 *= MIX_C
+            h1 ^= h1 >> S31
+
+            h2 = (tids ^ seed) * MIX_D + dim_idx * MIX_E
+            h2 ^= h2 >> S32
+            h2 *= MIX_E
+            h2 ^= h2 >> S31
+
+            u1 = (h1 >> S11).astype(np.float64) * SCALE + 1e-15
+            u2 = (h2 >> S11).astype(np.float64) * SCALE
+
+            base[start:end] = (
+                np.sqrt(-2.0 * np.log(u1)) * np.cos(2.0 * np.pi * u2)
+            ).astype(np.float32)
+
+        # L2-normalize
+        norms = np.linalg.norm(base, axis=1, keepdims=True)
+        base /= np.maximum(norms, 1e-8)
+
+        # IDF-weighted mean subtraction (decorrelate high-frequency tokens)
+        raw_df = self.db.load_df()
+        cw = np.array(
+            [self.idf.get(t, 0.0) * raw_df.get(t, 0) for t in self._corpus_vocab],
+            np.float32,
         )
-        vocab_f16 = base.cpu().numpy()
-
-        tau = emb.shape[1] ** -0.5
-        pos = (base > tau).to(torch.uint8).cpu().numpy()
-        neg = (base < -tau).to(torch.uint8).cpu().numpy()
-        pos_b = np.packbits(pos, axis=1)
-        neg_b = np.packbits(neg, axis=1)
-        pad = stride - pos_b.shape[1]
-        if pad:
-            pos_b = np.pad(pos_b, ((0, 0), (0, pad)))
-            neg_b = np.pad(neg_b, ((0, 0), (0, pad)))
-
-        pos64 = pos_b.view(np.uint64) & mask64
-        neg64 = neg_b.view(np.uint64) & mask64
-
-        g = torch.Generator(device="cpu").manual_seed(self.config.hdc_seed)
-        rho_w = torch.randperm(n_words, generator=g).numpy()
-        powers_w = [np.arange(n_words, dtype=np.int64)]
-        cur = rho_w.copy()
-        for _ in range(n - 1):
-            powers_w.append(cur.copy())
-            cur = cur[rho_w]
-
-        nv = vocab_f16.shape[0]
-        uni_bytes = nv * dim * 2
-        bits_offset = align8(uni_bytes)
-        pad_bytes = bits_offset - uni_bytes
+        cw_sum = cw.sum()
+        if cw_sum > 0:
+            cw /= cw_sum
+            base -= (cw[:, None] * base).sum(axis=0, keepdims=True)
 
         with open(self.db.vocab_file, "wb") as f:
-            f.write(vocab_f16.tobytes())
-            if pad_bytes:
-                f.write(b"\x00" * pad_bytes)
-            for k in range(n):
-                p = pos64[:, powers_w[k]].copy()
-                q = neg64[:, powers_w[k]].copy()
-                f.write(p.view(np.uint8).tobytes())
-                f.write(q.view(np.uint8).tobytes())
+            f.write(base.astype(np.float16).tobytes())
 
-        del base
-        torch.cuda.empty_cache()
+    def compute_token_weights(self, vocab_size: int, special_ids: set[int]):
+        w = np.zeros(vocab_size, dtype=np.float32)
+        vocab_arr = np.array(self._corpus_vocab, dtype=np.int64)
+        valid = vocab_arr < vocab_size
+        idf_vals = np.array(
+            [self.idf.get(t, 0.0) for t in self._corpus_vocab], np.float32
+        )
+        w[vocab_arr[valid]] = idf_vals[valid]
+        special_arr = np.array(
+            [t for t in special_ids if 0 <= t < vocab_size], dtype=np.int64
+        )
+        if len(special_arr):
+            w[special_arr] = 0.0
+        _arrays.set("idf_weights", w)
 
-    def _ensure_vocab(self):
-        if hasattr(self, "_vocab_f16"):
+    def _open_vocab_mmap(self):
+        if hasattr(self, "_vocab_f16") and self._vocab_f16 is not None:
             return
-        if self._emb_dim == 0:
-            raise ValueError("emb_dim unknown \u2014 run build_vocab_index first")
         if not self.db.vocab_file.exists():
             self.build_vocab_index()
-        n, dim = self.config.hdc_ngram, self.config.hdc_dimensions
-        stride = self._stride
-        nv = len(self._corpus_vocab)
-        uni_bytes = nv * dim * 2
-        bits_offset = align8(uni_bytes)
         self._vocab_f16 = np.memmap(
             self.db.vocab_file,
             dtype=np.float16,
             mode="r",
             offset=0,
-            shape=(nv, dim),
+            shape=(len(self._corpus_vocab), self.config.hdc_dimensions),
         )
-        self._vocab_bag = torch.from_numpy(self._vocab_f16.astype(np.float32))
-        bits = np.memmap(
-            self.db.vocab_file,
-            dtype=np.uint8,
-            mode="r",
-            offset=bits_offset,
-            shape=(n * 2, nv, stride),
-        )
-        self._vocab_ng_u8 = bits.reshape(n, 2, nv, stride)
-        self._vocab_ng64 = self._vocab_ng_u8.view(np.uint64)
 
-    def project(self, token_ids=None, flat_ids=None, offsets=None):
-        """Token IDs → continuous HDC unigram vectors (batch, dim) float16."""
+    def _ensure_vocab(self):
+        """Load vocab tensor on demand.  compact() drops it after each query."""
+        self._open_vocab_mmap()
+        if self._vocab_t is None:
+            self._vocab_t = torch.from_numpy(
+                np.array(self._vocab_f16, dtype=np.float32)
+            )
+
+    def load_vocab_full(self):
         self._ensure_vocab()
-        dim = self.config.hdc_dimensions
-        if flat_ids is not None:
-            batch = len(offsets) - 1
-            flat_np = flat_ids.astype(np.int64, copy=False)
-            offs = offsets
-        elif token_ids:
-            batch = len(token_ids)
-            arrs = [np.asarray(ids, dtype=np.int64) for ids in token_ids]
-            flat_np = np.concatenate(arrs) if len(arrs) > 1 else arrs[0].copy()
-            offs = np.zeros(batch + 1, dtype=np.int64)
-            np.cumsum([len(a) for a in arrs], out=offs[1:])
-        else:
-            raise ValueError("provide token_ids or flat_ids+offsets")
 
-        seg_np = np.repeat(np.arange(batch, dtype=np.int64), np.diff(offs))
+    def release_vocab_full(self):
+        self._vocab_t = None
+
+    def compact(self):
+        """Release the float32 vocab tensor between queries."""
+        # self._vocab_t = None
+        pass
+
+    def deep_compact(self):
+        """Full release of both the float32 tensor and the float16 mmap."""
+        self._vocab_t = None
+        if hasattr(self, "_vocab_f16") and self._vocab_f16 is not None:
+            del self._vocab_f16
+            self._vocab_f16 = None
+        gc.collect()
+
+    def _flat_offsets(self, token_ids=None, flat_ids=None, offsets=None):
+        if flat_ids is not None:
+            return flat_ids.astype(np.int64, copy=False), offsets
+        if token_ids:
+            arrs = [np.asarray(ids, dtype=np.int64) for ids in token_ids]
+            flat = np.concatenate(arrs) if len(arrs) > 1 else arrs[0].copy()
+            offs = np.zeros(len(token_ids) + 1, dtype=np.int64)
+            np.cumsum([len(a) for a in arrs], out=offs[1:])
+            return flat, offs
+        raise ValueError("provide token_ids or flat_ids+offsets")
+
+    def _remap_flat(self, flat_np):
         clipped = np.clip(flat_np, 0, len(self._remap_arr) - 1)
         remapped = self._remap_arr[clipped]
-        mapped = remapped >= 0
-        safe = np.clip(remapped, 0, None)
+        return remapped >= 0, np.clip(remapped, 0, None)
 
-        idf_w = tget("idf_weights")
+    def project_query(self, token_ids):
+        self._open_vocab_mmap()  # float16 mmap, no torch tensor
+        flat = np.array(token_ids[0], dtype=np.int64)
+        valid, safe = self._remap_flat(flat)
+        rows = self._vocab_f16[safe[valid]].astype(np.float32)
+        idf_w = _arrays.get("idf_weights")
+        w = idf_w[flat[valid]] if idf_w is not None else np.ones(valid.sum())
+        vec = (rows * w[:, None]).sum(axis=0, keepdims=True)
+        vec /= np.maximum(np.linalg.norm(vec, axis=1, keepdims=True), 1e-8)
+        return vec.astype(np.float16)
+
+    def project(self, token_ids=None, flat_ids=None, offsets=None):
+        self._ensure_vocab()
+        flat_np, offs = self._flat_offsets(token_ids, flat_ids, offsets)
+        mapped, safe = self._remap_flat(flat_np)
+
+        idf_w = _arrays.get("idf_weights")
         safe_t = torch.from_numpy(safe.astype(np.int64))
         mapped_f = torch.from_numpy(mapped).float()
         w = (
-            idf_w[torch.from_numpy(flat_np)].float() * mapped_f
+            torch.from_numpy(idf_w[flat_np]) * mapped_f
             if idf_w is not None
             else mapped_f
         )
-        offsets_t = torch.from_numpy(offs.astype(np.int64))
+
         unigrams = F.embedding_bag(
             safe_t,
-            self._vocab_bag,
-            offsets_t,
+            self._vocab_t,
+            torch.from_numpy(offs.astype(np.int64)),
             per_sample_weights=w,
             mode="sum",
             include_last_offset=True,
         )
-        w_sums = torch.zeros(batch, dtype=torch.float32)
-        w_sums.scatter_add_(0, torch.from_numpy(seg_np), w)
-        unigrams /= w_sums.unsqueeze(-1).clamp(1e-6)
         unigrams = F.normalize(unigrams, p=2, dim=1)
-        unigrams *= math.sqrt(dim / self._emb_dim)
-        return unigrams.half()
+        return unigrams.half().numpy()
 
-    def _ensure_bind_workspace(self, rows: int, n_words: int) -> dict[str, np.ndarray]:
-        """Allocate (or grow) reusable uint64 buffers for n-gram bind chain."""
-        r0, c0 = self._bind_ws_shape
-        if (self._bind_ws is None) or (rows > r0) or (n_words != c0):
-            alloc_rows = max(rows, r0)
-            shape = (alloc_rows, n_words)
-            self._bind_ws = {
-                "bp": np.empty(shape, dtype=np.uint64),
-                "bn": np.empty(shape, dtype=np.uint64),
-                "bufp": np.empty(shape, dtype=np.uint64),
-                "bufn": np.empty(shape, dtype=np.uint64),
-                "tmp": np.empty(shape, dtype=np.uint64),
-                "kp_buf": np.empty(shape, dtype=np.uint64),
-                "kn_buf": np.empty(shape, dtype=np.uint64),
-            }
-            self._bind_ws_shape = (alloc_rows, n_words)
-        return {k: v[:rows, :n_words] for k, v in self._bind_ws.items()}
+    def _content_ngrams(
+        self,
+        flat_np: np.ndarray,
+        seg_np: np.ndarray,
+        mapped: np.ndarray,
+        batch: int,
+        dims: int,
+        stride: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Skip-gram pairs hashed into the n-gram dimension region [D_uni, D)."""
+        n = self.config.hdc_ngram
+        T = len(flat_np)
+        C = self._base_activate
+        D_uni, D_ngram = self._D_uni, self._D_ngram
 
-    def release_workspace(self):
-        """Free the pre-allocated binding workspace buffers."""
-        if self._bind_ws is not None:
-            self._bind_ws = None
-            self._bind_ws_shape = (0, 0)
-            gc.collect()
+        token_hashes = flat_np.astype(np.uint64) * self._token_mix
+        token_hashes ^= token_hashes >> np.uint64(32)
+
+        idf_w = _arrays.get("idf_weights")
+        token_idf = idf_w[flat_np] if idf_w is not None else np.ones(T, np.float32)
+
+        positive_idf = token_idf[token_idf > 0]
+        idf_scale = n / max(
+            float(np.median(positive_idf)) if len(positive_idf) else 1.0, 1e-9
+        )
+
+        # Narrow accumulator: only D_ngram columns instead of full dims.
+        accum = np.zeros((batch, D_ngram), dtype=np.int32)
+        pair_counts = np.zeros(batch, dtype=np.int32)
+        hash_b_slots = np.arange(C, dtype=np.uint64) * self._hash_b
+        flat_size = batch * D_ngram
+        D_ngram_u64 = np.uint64(D_ngram)
+
+        # Use bitwise AND when D_ngram is a power of 2 (avoids uint64 division).
+        dim_pow2 = (D_ngram & (D_ngram - 1)) == 0
+        dim_mask = np.uint64(D_ngram - 1) if dim_pow2 else None
+
+        for g in range(1, n):
+            nw = T - g
+            if nw <= 0:
+                continue
+
+            valid = (
+                mapped[:nw] & mapped[g : nw + g] & (seg_np[:nw] == seg_np[g : nw + g])
+            )
+            v_idx = np.where(valid)[0]
+            if len(v_idx) == 0:
+                continue
+
+            v_addrs = token_hashes[v_idx] + token_hashes[v_idx + g]
+            v_seg = seg_np[v_idx].astype(np.intp)
+            v_weights = np.clip(
+                np.round(
+                    np.minimum(token_idf[v_idx], token_idf[v_idx + g]) * idf_scale
+                ).astype(np.int16),
+                1,
+                n,
+            )
+
+            pair_counts += np.bincount(v_seg, minlength=batch)
+
+            h = v_addrs[:, None] * self._hash_a + hash_b_slots
+            h ^= h >> np.uint64(32)
+
+            # Fused linear index: compute seg*D_ngram + dim directly in uint64,
+            # avoiding a separate (V,C)-shaped dim_idx intermediate.
+            seg_offset = v_seg.astype(np.uint64)[:, None] * D_ngram_u64
+            if dim_pow2:
+                linear = (seg_offset + (h & dim_mask)).ravel().astype(np.intp)
+            else:
+                linear = (seg_offset + (h % D_ngram_u64)).ravel().astype(np.intp)
+
+            # Sign + weight: use np.where to skip the intermediate `signs` array.
+            w_col = v_weights[:, None].astype(np.int32)
+            sign_bits = (h >> np.uint64(33)) & np.uint64(1)
+            weighted = np.where(sign_bits, w_col, np.negative(w_col)).ravel()
+
+            accum.ravel()[:] += np.bincount(
+                linear, weights=weighted, minlength=flat_size
+            ).astype(np.int32)
+
+        # Adaptive threshold
+        vpd = pair_counts.astype(np.float32) * C / D_ngram
+        thresholds = np.maximum(2, np.ceil(np.sqrt(vpd))).astype(np.int32)[:, None]
+
+        # Expand narrow accum back to full width for packbits alignment.
+        # Columns [0, D_uni) are zero → produce zero bits, masked out anyway.
+        full_accum = np.zeros((batch, dims), dtype=np.int32)
+        full_accum[:, D_uni : D_uni + D_ngram] = accum
+
+        ngram_p = np.packbits((full_accum >= thresholds).astype(np.uint8), axis=1)
+        ngram_n = np.packbits((full_accum <= -thresholds).astype(np.uint8), axis=1)
+
+        pad = stride - ngram_p.shape[1]
+        if pad > 0:
+            ngram_p = np.pad(ngram_p, ((0, 0), (0, pad)))
+            ngram_n = np.pad(ngram_n, ((0, 0), (0, pad)))
+
+        return (
+            ngram_p.view(np.uint64) & self._ngram_mask,
+            ngram_n.view(np.uint64) & self._ngram_mask,
+        )
+
+    @property
+    def score_alpha(self) -> float:
+        N = self.config.hdc_ngram
+        return (N - 1) / N
+
+    def adaptive_alpha(self, q_lit_uni: float, q_lit_ngram: float) -> float:
+        """Per-query unigram weight based on n-gram confidence."""
+        if q_lit_ngram <= 0 or self._D_ngram <= 0:
+            return 1.0
+        expected_ratio = self._D_ngram / max(self._D_uni, 1)
+        actual_ratio = q_lit_ngram / max(q_lit_uni, 1.0)
+        ng_confidence = min(1.0, actual_ratio / expected_ratio)
+        max_ng_weight = 1.0 / self.config.hdc_ngram
+        return 1.0 - max_ng_weight * ng_confidence
+
+    @property
+    def uni_mask_u64(self) -> np.ndarray:
+        return self._uni_mask
+
+    @property
+    def ngram_mask_u64(self) -> np.ndarray:
+        return self._ngram_mask
+
+    @property
+    def D_uni(self) -> int:
+        return self._D_uni
+
+    @property
+    def D_ngram(self) -> int:
+        return self._D_ngram
 
     def encode(self, unigrams=None, token_ids=None, flat_ids=None, offsets=None):
-        if self._emb_dim == 0:
-            raise ValueError("emb_dim unknown \u2014 run build_vocab_index first")
+        """Encode documents into ternary HDC bitmaps."""
         self._ensure_vocab()
         n, dim = self.config.hdc_ngram, self.config.hdc_dimensions
         stride = self._stride
-        n_words = stride // 8
-        mask64 = mask64_for_dims(dim, stride)
-        tau = self._emb_dim**-0.5
+        tau = dim**-0.5
 
-        flat_np = seg_np = mapped = safe = offs = None
-        if flat_ids is not None:
-            flat_np = flat_ids.astype(np.int64, copy=False)
-            offs = offsets
-        elif token_ids:
-            arrs = [np.asarray(ids, dtype=np.int64) for ids in token_ids]
-            flat_np = np.concatenate(arrs) if len(arrs) > 1 else arrs[0].copy()
-            offs = np.zeros(len(token_ids) + 1, dtype=np.int64)
-            np.cumsum([len(a) for a in arrs], out=offs[1:])
-
-        if flat_np is not None:
+        # Prepare token arrays
+        flat_np = seg_np = mapped = None
+        if flat_ids is not None or token_ids:
+            flat_np, offs = self._flat_offsets(token_ids, flat_ids, offsets)
+            mapped, _ = self._remap_flat(flat_np)
             seg_np = np.repeat(np.arange(len(offs) - 1, dtype=np.int64), np.diff(offs))
-            clipped = np.clip(flat_np, 0, len(self._remap_arr) - 1)
-            remapped = self._remap_arr[clipped]
-            mapped = remapped >= 0
-            safe = np.clip(remapped, 0, None)
 
+        # Unigram projection + ternary quantization
         if unigrams is None:
             unigrams = self.project(
                 token_ids=token_ids, flat_ids=flat_ids, offsets=offsets
             )
         batch = unigrams.shape[0]
 
-        uni_np = unigrams.float().cpu().numpy()
+        uni_np = unigrams.astype(np.float32)
         u_pos = np.packbits(uni_np > tau, axis=1)
         u_neg = np.packbits(uni_np < -tau, axis=1)
         pad = stride - u_pos.shape[1]
         if pad:
             u_pos = np.pad(u_pos, ((0, 0), (0, pad)))
             u_neg = np.pad(u_neg, ((0, 0), (0, pad)))
-        u_p64 = u_pos.view(np.uint64) & mask64
-        u_n64 = u_neg.view(np.uint64) & mask64
 
-        out_p64, out_n64 = u_p64, u_n64
+        u_p64 = u_pos.view(np.uint64) & self._uni_mask
+        u_n64 = u_neg.view(np.uint64) & self._uni_mask
 
-        if flat_np is not None and n > 1:
-            nw = len(flat_np) - n + 1
-            if nw > 0:
-                valid = seg_np[:nw] == seg_np[n - 1 :]
-                for k in range(n):
-                    valid &= mapped[k : k + nw]
-                inv = ~valid
+        lit_uni = np.bitwise_count(u_p64 | u_n64).sum(axis=1, dtype=np.int32)
 
-                ws = self._ensure_bind_workspace(rows=nw, n_words=n_words)
-                bp, bn = ws["bp"], ws["bn"]
-                bufp, bufn = ws["bufp"], ws["bufn"]
-                tmp, kp_buf, kn_buf = ws["tmp"], ws["kp_buf"], ws["kn_buf"]
+        # N-gram layer
+        if flat_np is not None and n > 1 and len(flat_np) > 1:
+            ngram_p, ngram_n = self._content_ngrams(
+                flat_np, seg_np, mapped, batch, dim, stride
+            )
+            lit_ngram = np.bitwise_count(ngram_p | ngram_n).sum(axis=1, dtype=np.int32)
+            out_p64 = u_p64 | ngram_p
+            out_n64 = u_n64 | ngram_n
+        else:
+            lit_ngram = np.zeros(batch, dtype=np.int32)
+            out_p64 = u_p64
+            out_n64 = u_n64
 
-                idx0 = safe[:nw]
-                np.take(self._vocab_ng64[0, 0], idx0, axis=0, out=bp)
-                np.take(self._vocab_ng64[0, 1], idx0, axis=0, out=bn)
+        return {
+            "pos": out_p64.view(np.uint8).reshape(batch, stride).copy(),
+            "neg": out_n64.view(np.uint8).reshape(batch, stride).copy(),
+            "lit_uni": lit_uni,
+            "lit_ngram": lit_ngram,
+        }
 
-                for k in range(1, n):
-                    idxk = safe[k : k + nw]
-                    np.take(self._vocab_ng64[k, 0], idxk, axis=0, out=kp_buf)
-                    np.take(self._vocab_ng64[k, 1], idxk, axis=0, out=kn_buf)
-                    bind_ternary_bits_into(bp, bn, kp_buf, kn_buf, bufp, bufn, tmp)
-                    bp, bufp = bufp, bp
-                    bn, bufn = bufn, bn
-
-                if inv.any():
-                    bp[inv] = 0
-                    bn[inv] = 0
-                bp &= mask64
-                bn &= mask64
-
-                coh = np.sqrt(popcount64(bp | bn).sum(axis=1).astype(np.float32) + 1e-6)
-
-                wseg = seg_np[:nw]
-                uni_density = (
-                    popcount64(u_p64 | u_n64).sum(axis=1).astype(np.float32) / dim
-                )
-                agg_p = np.zeros((batch, n_words), dtype=np.uint64)
-                agg_n = np.zeros((batch, n_words), dtype=np.uint64)
-
-                for bi in range(batch):
-                    rows = np.where(wseg == bi)[0]
-                    if rows.size == 0:
-                        continue
-                    doc_coh = coh[rows]
-                    thr = adaptive_threshold(torch.from_numpy(doc_coh))
-                    sel = rows[doc_coh >= thr] if thr > 0 else rows
-                    if sel.size == 0:
-                        continue
-
-                    mean_bits = (coh[sel] ** 2).mean()
-                    p = mean_bits / dim
-                    target = max(uni_density[bi], 0.01)
-                    if 0 < p < 1:
-                        m_cap = max(
-                            1,
-                            int(np.ceil(np.log1p(-target) / np.log1p(-p))),
-                        )
-                        if sel.size > m_cap:
-                            top_idx = np.argpartition(coh[sel], -m_cap)[-m_cap:]
-                            sel = sel[top_idx]
-
-                    ap = np.bitwise_or.reduce(bp[sel], axis=0)
-                    an = np.bitwise_or.reduce(bn[sel], axis=0)
-                    coll = ap & an
-                    ap &= ~coll
-                    an &= ~coll
-                    agg_p[bi] = ap
-                    agg_n[bi] = an
-
-                agg_p &= mask64
-                agg_n &= mask64
-
-                ng_pos = np.unpackbits(
-                    agg_p.view(np.uint8).reshape(batch, stride), axis=1
-                )[:, :dim].astype(np.float32)
-                ng_neg = np.unpackbits(
-                    agg_n.view(np.uint8).reshape(batch, stride), axis=1
-                )[:, :dim].astype(np.float32)
-                agree = (ng_pos * (uni_np > 0)) + (ng_neg * (uni_np < 0))
-                boosted = uni_np * (1.0 + agree)
-
-                out_pos = np.packbits(boosted > tau, axis=1)
-                out_neg = np.packbits(boosted < -tau, axis=1)
-                pad = stride - out_pos.shape[1]
-                if pad:
-                    out_pos = np.pad(out_pos, ((0, 0), (0, pad)))
-                    out_neg = np.pad(out_neg, ((0, 0), (0, pad)))
-                out_p64 = out_pos.view(np.uint64) & mask64
-                out_n64 = out_neg.view(np.uint64) & mask64
-
-        pos_p = out_p64.view(np.uint8).reshape(batch, stride).copy()
-        neg_p = out_n64.view(np.uint8).reshape(batch, stride).copy()
-        return {"pos": pos_p, "neg": neg_p}
+    def release_workspace(self):
+        pass
 
     def clear(self):
-        tdel("projection")
-        for a in ("_vocab_f16", "_vocab_ng_u8", "_vocab_ng64", "_vocab_bag"):
-            if hasattr(self, a):
-                delattr(self, a)
-        gc.collect()
-        for f in (self.db.corpus_file, self.db.vocab_file, self.proj_path):
+        if hasattr(self, "_vocab_f16"):
+            delattr(self, "_vocab_f16")
+        self._vocab_t = None
+        self.db.invalidate_corpus()
+        trim_memory()
+        for f in (
+            self.db.corpus_file,
+            self.db.vocab_file,
+            self.db.lit_file,
+            self.db.uni_lit_file,
+        ):
             if f.exists():
                 f.unlink()
         self._corpus_vocab, self._remap = [], {}
         self._remap_arr = np.zeros(1, dtype=np.int32)
-        self._bind_ws = None
-        self._bind_ws_shape = (0, 0)
-
-
-# ── Embedding Extractor ───────────────────────────────────────────
-
-
-class EmbeddingExtractor:
-    """Extracts and caches the token embedding table from a GGUF model.
-
-    Only needed during index building. After the vocab index is built,
-    the embedding table can be released — search/retrieval never touches it.
-    """
-
-    def __init__(self, gguf_path: str, cache_dir: Path, logger: logging.Logger):
-        self._gguf_path = gguf_path
-        self._emb_path = cache_dir / "embeddings.pt"
-        self.logger = logger
-        self._loaded = False
-
-    def ensure(self):
-        """Load cached embeddings or extract from GGUF."""
-        if self._loaded:
-            return
-        if self._emb_path.exists():
-            emb = torch.load(self._emb_path, map_location="cpu", weights_only=True)
-            tset("embedding_table", emb)
-            self._loaded = True
-            self.logger.info(f"Loaded cached embeddings: {emb.shape}")
-            return
-        self._extract()
-
-    def release(self):
-        """Free the embedding table from memory."""
-        tdel("embedding_table")
-        torch.cuda.empty_cache()
-        gc.collect()
-        self._loaded = False
-
-    @staticmethod
-    def set_idf_weights(idf: dict[int, float], vocab_size: int, special_ids: set[int]):
-        """Build IDF weight tensor and store in tensor registry."""
-        w = torch.ones(vocab_size, dtype=torch.float32)
-        for tid, weight in idf.items():
-            if 0 <= tid < vocab_size:
-                w[tid] = weight
-        for tid in special_ids:
-            if 0 <= tid < vocab_size:
-                w[tid] = 0.0
-        tset("idf_weights", w)
-
-    def _extract(self):
-        self.logger.info(f"Extracting embeddings from {self._gguf_path}")
-        reader = GGUFReader(str(self._gguf_path))
-        for t in reader.tensors:
-            if t.name != "token_embd.weight":
-                continue
-            shape = tuple(int(x) for x in reversed(t.shape))
-            raw = np.array(t.data)
-            qn = t.tensor_type.name
-
-            if qn == "F32":
-                data = raw.view(np.float32).copy().reshape(shape)
-            elif qn == "F16":
-                data = raw.view(np.float16).copy().reshape(shape).astype(np.float32)
-            elif qn == "BF16":
-                u16 = raw.view(np.uint16).reshape(shape)
-                data = np.zeros(shape, dtype=np.float32)
-                data.view(np.uint32)[:] = u16.astype(np.uint32) << 16
-            elif qn == "Q8_0":
-                nb = int(np.prod(shape)) // 32
-                blk = raw[: nb * 34].reshape(nb, 34)
-                d = np.frombuffer(blk[:, :2].copy().tobytes(), dtype=np.float16).astype(
-                    np.float32
-                )
-                qs = blk[:, 2:].copy().view(np.int8).astype(np.float32)
-                data = (qs * d[:, None]).reshape(shape)
-            elif qn == "Q4_0":
-                nb = int(np.prod(shape)) // 32
-                blk = raw[: nb * 18].reshape(nb, 18)
-                d = (
-                    np.frombuffer(blk[:, :2].copy().tobytes(), dtype=np.float16)
-                    .astype(np.float32)
-                    .reshape(nb, 1)
-                )
-                qs = blk[:, 2:]
-                lo = (qs & 0xF).astype(np.float32) - 8.0
-                hi = (qs >> 4).astype(np.float32) - 8.0
-                vals = np.empty((nb, 32), dtype=np.float32)
-                vals[:, :16] = d * lo
-                vals[:, 16:] = d * hi
-                data = vals.reshape(shape)
-            elif qn == "Q6_K":
-                nb = int(np.prod(shape)) // 256
-                blk = raw[: nb * 210].reshape(nb, 210)
-                ql = blk[:, :128]
-                qh = blk[:, 128:192]
-                sc = blk[:, 192:208].copy().view(np.int8).astype(np.float32)
-                d = (
-                    np.frombuffer(blk[:, 208:210].copy().tobytes(), dtype=np.float16)
-                    .astype(np.float32)
-                    .reshape(nb, 1)
-                )
-                data = np.zeros((nb, 256), dtype=np.float32)
-                for half in range(2):
-                    ql_h = ql[:, half * 64 : (half + 1) * 64].astype(np.int32)
-                    qh_h = qh[:, half * 32 : (half + 1) * 32].astype(np.int32)
-                    s = half * 8
-                    q1 = ((ql_h[:, :32] & 0xF) | (((qh_h >> 0) & 3) << 4)).astype(
-                        np.float32
-                    ) - 32
-                    q2 = ((ql_h[:, 32:] & 0xF) | (((qh_h >> 2) & 3) << 4)).astype(
-                        np.float32
-                    ) - 32
-                    q3 = ((ql_h[:, :32] >> 4) | (((qh_h >> 4) & 3) << 4)).astype(
-                        np.float32
-                    ) - 32
-                    q4 = ((ql_h[:, 32:] >> 4) | (((qh_h >> 6) & 3) << 4)).astype(
-                        np.float32
-                    ) - 32
-                    b = half * 128
-                    data[:, b : b + 32] = d * sc[:, s : s + 1] * q1
-                    data[:, b + 32 : b + 64] = d * sc[:, s + 2 : s + 3] * q2
-                    data[:, b + 64 : b + 96] = d * sc[:, s + 4 : s + 5] * q3
-                    data[:, b + 96 : b + 128] = d * sc[:, s + 6 : s + 7] * q4
-                data = data.reshape(shape)
-            else:
-                try:
-                    from gguf.quants import dequantize
-
-                    data = dequantize(raw, qn).reshape(shape)
-                    self.logger.info(f"Dequantized {qn} via gguf.quants")
-                except (ImportError, Exception) as e:
-                    raise ValueError(
-                        f"Unsupported quantization: {qn} "
-                        f"(gguf.quants fallback failed: {e})"
-                    )
-
-            emb = torch.from_numpy(data.copy()).float()
-            torch.save(emb, self._emb_path)
-            tset("embedding_table", emb)
-            self._loaded = True
-            self.logger.info(f"Extracted embeddings: {emb.shape} ({qn}\u2192fp32)")
-            return
-        raise KeyError("token_embd.weight not found in GGUF")
-
-
-# ── Retriever ──────────────────────────────────────────────────────
 
 
 class Retriever:
@@ -1180,193 +1652,69 @@ class Retriever:
         self.db, self.hdc = db, hdc
         self._tokenizer = tokenizer
         self.config, self.logger = config, logger
-        self._turns: list[tuple[np.ndarray, np.ndarray]] = []
         self._token_counts = db.get_token_counts()
+        self._source_map = db.get_source_map()
+        self._eligible_cache: tuple[int, np.ndarray, int] | None = None
 
-    def add_turn(self, text: str):
-        """Encode a model response and store its ternary bitvector.
-
-        Only model responses are tracked — they represent where the
-        conversation *actually went*, not where the user pointed it.
-        The current query is already the search target; blending
-        previous queries would feed the retrieval system's own
-        input back to itself (echo), not the model's expansion
-        of the topic (resonance).
-        """
-        tids = self._tokenizer.bulk_tokenize([text])
-        bm = self.hdc.encode(token_ids=tids)
-        self._turns.append((bm["pos"][0].copy(), bm["neg"][0].copy()))
-
-    def clear_turns(self):
-        self._turns.clear()
-
-    def _ternary_blend(self, query_bv: tuple, content_count: int) -> tuple:
-        """Blend current query with previous model responses.
-
-        Operates entirely in bitvector space — no float→ternary
-        bottleneck. The query's zero (abstain) dimensions let response
-        history signal propagate unopposed; the query's lit dimensions
-        carry its specific intent. Adaptive weighting: short referential
-        queries lean on response history, substantive queries stand alone.
-
-        Response-only tracking means decay=0.5 loses one weight level
-        per exchange instead of two, doubling effective memory horizon.
-        """
-        if not self._turns:
-            return query_bv
-
-        dim = self.hdc.config.hdc_dimensions
-        ngram = self.hdc.config.hdc_ngram
-        query_weight = min(0.5, content_count / (ngram * 2))
-
-        decay = 0.5
-        n = len(self._turns)
-        hist_weights = [decay ** (n - i) for i in range(n)]
-        hist_total = sum(hist_weights)
-
-        # Normalize: response history gets (1 - query_weight), query gets query_weight
-        if hist_total > 1e-6:
-            hist_scale = (1.0 - query_weight) / hist_total
-            hist_weights = [w * hist_scale for w in hist_weights]
-        weights = hist_weights + [query_weight]
-
-        self.logger.info(
-            f"[Blend] content={content_count} ngram={ngram} "
-            f"qw={query_weight:.2f} responses={n}"
+    def _get_eligible(self, max_doc: int) -> tuple[np.ndarray, int]:
+        if self._eligible_cache is not None and self._eligible_cache[0] == max_doc:
+            return self._eligible_cache[1], self._eligible_cache[2]
+        eligible = np.where(self._token_counts <= max_doc)[0]
+        mdl = (
+            max(1, int(np.median(self._token_counts[eligible]))) if len(eligible) else 1
         )
+        self._eligible_cache = (max_doc, eligible, mdl)
+        return eligible, mdl
 
-        # Accumulate weighted votes: +1, 0, -1 per dimension
-        accum = np.zeros(dim, dtype=np.float32)
-        all_bv = list(self._turns) + [query_bv]
-        for (pos_u8, neg_u8), w in zip(all_bv, weights):
-            p = np.unpackbits(pos_u8)[:dim].astype(np.float32)
-            n_bits = np.unpackbits(neg_u8)[:dim].astype(np.float32)
-            accum += w * (p - n_bits)
-
-        # Threshold back to ternary
-        stride = self.hdc._stride
-        out_pos = np.packbits((accum > 0).astype(np.uint8))
-        out_neg = np.packbits((accum < 0).astype(np.uint8))
-        # Pad to stride
-        if len(out_pos) < stride:
-            out_pos = np.pad(out_pos, (0, stride - len(out_pos)))
-            out_neg = np.pad(out_neg, (0, stride - len(out_neg)))
-        # Mask padding bits
-        mask64 = mask64_for_dims(dim, stride)
-        out_p = (out_pos[:stride].view(np.uint64) & mask64).view(np.uint8)
-        out_n = (out_neg[:stride].view(np.uint64) & mask64).view(np.uint8)
-        return (out_p, out_n)
-
-    def _dedup(self, results: list[dict]) -> list[dict]:
-        """Fast textual subset dedup — catches exact containment."""
-        n = len(results)
+    def _mmr(
+        self,
+        candidates: list[dict],
+        q_pos: np.ndarray,
+        q_neg: np.ndarray,
+        dp64: np.ndarray,
+        dn64: np.ndarray,
+        lit: np.ndarray,
+        budget: int,
+    ) -> list[dict]:
+        """Incremental multiplicative MMR in ternary bitspace. O(n·k) memory."""
+        n = len(candidates)
         if n <= 1:
-            return results
-        sets = [set(r["memory"]["text"].lower().split()) for r in results]
-        keep = [True] * n
-        for i in range(n):
-            if not keep[i]:
+            return candidates
+
+        qp64 = q_pos.ravel().view(np.uint64)[None, :]
+        qn64 = q_neg.ravel().view(np.uint64)[None, :]
+        q_sims = score64(dp64, dn64, qp64, qn64)
+        q_range = q_sims.max() - q_sims.min()
+        q_norm = (q_sims - q_sims.min()) / (q_range + 1e-6)
+        tcounts = np.array([c["token_count"] for c in candidates], dtype=np.int32)
+
+        selected, total = [], 0
+        mask = np.ones(n, dtype=bool)
+        max_sim = np.zeros(n, dtype=np.float32)
+
+        while mask.any():
+            scores = q_norm * (1.0 - np.clip(max_sim, 0.0, None))
+            scores[~mask] = -np.inf
+            best = int(np.argmax(scores))
+            if total + tcounts[best] > budget:
+                mask[best] = False
                 continue
-            for j in range(i + 1, n):
-                if not keep[j]:
-                    continue
-                if sets[i] <= sets[j]:
-                    keep[i] = False
-                    break
-                elif sets[j] <= sets[i]:
-                    keep[j] = False
-        out = [r for i, r in enumerate(results) if keep[i]]
-        if len(out) < n:
-            self.logger.info(f"[Dedup] subset: {n}\u2192{len(out)}")
-        return out
+            selected.append(best)
+            total += int(tcounts[best])
+            mask[best] = False
+            if mask.any():
+                raw_b = score64(dp64, dn64, dp64[best], dn64[best])
+                np.maximum(
+                    max_sim, raw_b / np.sqrt(lit * lit[best]).clip(1.0), out=max_sim
+                )
 
-    def _hdc_mmr(self, results: list[dict], q_pos, q_neg, budget: int) -> list[dict]:
-        """Coverage-aware greedy selection in packed ternary HDC space.
-
-        Marginal score = retrieval_score × (novelty / null_novelty)
-
-        null_novelty = 1 - d_c is the expected novelty of a vector
-        statistically independent of the current coverage accumulator.
-        The ratio acts as a likelihood test: >1 means the candidate
-        is more novel than chance → score preserved or boosted,
-        <1 means more redundant than chance → score suppressed.
-
-        No λ parameter — coverage density IS the adaptive tradeoff.
-        Early selections (sparse coverage) → near-pure relevance.
-        Late selections (dense coverage) → diversity dominates.
-        Collision zeroing on the accumulator creates natural back-
-        pressure: ambiguous dimensions don't count as covered, so
-        the system stays in relevance mode longer when the selected
-        set contains contradictory signals.
-        """
-        n = len(results)
-        if n <= 1:
-            return results
-
-        dim = self.config.hdc_dimensions
-        indices = [r["memory"]["hdv_idx"] for r in results]
-        tcounts = [r["memory"].get("token_count", 0) for r in results]
-        scores = np.array([r["hdc_score"] for r in results], dtype=np.float32)
-
-        dp, dn = self.db.get_bitmaps(indices)
-        dp64, dn64 = dp.view(np.uint64), dn.view(np.uint64)
-        mask = mask64_for_dims(dim, self.hdc._stride).ravel()
-
-        # Precompute per-candidate lit dimensions
-        cand_lit = np.array(
-            [popcount64((dp64[i] & mask) | (dn64[i] & mask)).sum() for i in range(n)],
-            dtype=np.float32,
-        )
-
-        cov_p = np.zeros_like(dp64[0])
-        cov_n = np.zeros_like(dn64[0])
-
-        alive = np.ones(n, dtype=bool)
-        accepted, total = [], 0
-
-        while alive.any():
-            cov_lit = popcount64(cov_p | cov_n).sum()
-            d_c = cov_lit / dim
-            # Null model: expected novelty of an independent vector
-            # Floor at 1/dim avoids division by zero at full saturation
-            null_novelty = max(1.0 - d_c, 1.0 / dim)
-
-            # Score all alive candidates against current coverage
-            marginal = np.full(n, -np.inf, dtype=np.float32)
-            for i in np.where(alive)[0]:
-                if total + tcounts[i] > budget:
-                    alive[i] = False
-                    continue
-                if cand_lit[i] == 0:
-                    alive[i] = False
-                    continue
-                cp = dp64[i] & mask
-                cn = dn64[i] & mask
-                novel = popcount64((cp | cn) & ~(cov_p | cov_n)).sum()
-                novelty = novel / cand_lit[i]
-                marginal[i] = scores[i] * (novelty / null_novelty)
-
-            best = np.argmax(marginal)
-            if marginal[best] <= 0:
-                break
-
-            accepted.append(results[best])
-            total += tcounts[best]
-            alive[best] = False
-
-            # Update coverage — collision zeroing preserves ternary invariant
-            cov_p |= dp64[best] & mask
-            cov_n |= dn64[best] & mask
-            coll = cov_p & cov_n
-            cov_p &= ~coll
-            cov_n &= ~coll
-
-        final_cov = popcount64(cov_p | cov_n).sum() / dim
         self.logger.info(
-            f"[HDC-MMR] {n}\u2192{len(accepted)} "
-            f"tokens={total:,} cov={final_cov:.1%}"
+            f"[MMR] n={n} rel=[{q_sims.min():.3f},{q_sims.max():.3f}] "
+            f"selected={len(selected)} tokens={total:,}"
         )
-        return accepted
+        out = [candidates[i] for i in selected]
+        out.sort(key=lambda r: r["hdc_score"], reverse=True)
+        return out
 
     def search(
         self,
@@ -1375,144 +1723,155 @@ class Retriever:
         track: bool = True,
         enabled_sources: set = None,
     ) -> list[dict]:
+        """Retrieve memories relevant to *query* within *token_budget*."""
         if self.db.count() == 0:
             return []
+
+        query = query.rstrip().rstrip("?!.,;:…\n\r\t").rstrip()
+        query = strip_structural_keys(query)
+        if not query:
+            return []
+
         self.logger.info(f"[Search] Query: {len(query)} chars")
 
         tids = self._tokenizer.bulk_tokenize([query])
-        qe = self.hdc.project(token_ids=tids)
+        #qe = self.hdc.project(token_ids=tids)
+        qe = self.hdc.project_query(token_ids=tids)
         bm = self.hdc.encode(unigrams=qe, token_ids=tids)
+        q_lit_uni = float(bm["lit_uni"][0])
+        q_lit_ngram = float(bm.get("lit_ngram", np.zeros(1))[0])
 
-        if track and self._turns:
-            # Count content tokens for adaptive weight
-            flat = np.asarray(tids[0], dtype=np.int64)
-            remap = self.hdc._remap_arr
-            clipped = np.clip(flat, 0, len(remap) - 1)
-            content_count = int((remap[clipped] >= 0).sum())
+        uni_mask = getattr(self.hdc, "uni_mask_u64", None)
+        ngram_mask = getattr(self.hdc, "ngram_mask_u64", None)
+        alpha = (
+            self.hdc.adaptive_alpha(q_lit_uni, q_lit_ngram)
+            if hasattr(self.hdc, "adaptive_alpha")
+            else None
+        )
 
-            query_bv = (bm["pos"][0].copy(), bm["neg"][0].copy())
-            blended = self._ternary_blend(query_bv, content_count)
-
-            # Query is NOT stored — only model responses go into _turns
-            # via add_turn() called from the UI after generation.
-
-            # Replace bm with blended for search
-            bm["pos"][0] = blended[0]
-            bm["neg"][0] = blended[1]
-
-        # First turn with no response history: search unblended.
-        # Response gets added to _turns after generation via add_turn().
-
+        # 1. HDC progressive pruning
         max_doc = token_budget // self.config.min_context
-        eligible = np.where(self._token_counts <= max_doc)[0]
-        mdl = max(1, int(np.median(self._token_counts[eligible])))
-
-        # Widen pruning target: hdc_ngram multiplier gives _hdc_mmr a
-        # deeper candidate pool to reorder. The pruning stage is cheap
-        # (packed bitwise scan), the expensive part is bitmap fetch +
-        # coverage loop in _hdc_mmr which is O(target) not O(corpus).
-        target = (
-            max(1, int((token_budget * self.config.min_context) // mdl))
-            * self.config.hdc_ngram
-        )
-
+        eligible, mdl = self._get_eligible(max_doc)
+        target = max(1, int((token_budget * self.config.min_context) // mdl))
         indices, scores = self.db.search(
-            bm["pos"], bm["neg"], target, eligible, self.logger
+            bm["pos"],
+            bm["neg"],
+            target,
+            eligible,
+            self.logger,
+            q_lit_uni=q_lit_uni,
+            q_lit_ngram=q_lit_ngram,
+            uni_mask=uni_mask,
+            ngram_mask=ngram_mask,
+            alpha=alpha,
         )
-        thr = adaptive_threshold(torch.from_numpy(scores))
-        pre = len(indices)
-
-        if thr and thr != 0.0:
-            m = scores >= thr
-            indices, scores = indices[m], scores[m]
-
-        self.logger.info(
-            f"[Search] {len(eligible):,}\u2192{pre}\u2192{len(indices)} "
-            f"(prune\u2192threshold)"
-            + (f" thr={thr:.1f}" if thr and thr != 0.0 else "")
-        )
-
         if len(indices) == 0:
             return []
 
-        sel = indices.tolist()
-        smap = dict(zip(sel, scores.tolist()))
-        mems = self.db.get_memories(sel)
+        # Filter positives
+        pos_mask = scores > 0
+        indices, scores = indices[pos_mask], scores[pos_mask]
+        if len(indices) == 0:
+            self.logger.info(f"[Search] {len(eligible):,}→0 (all ≤ 0)")
+            return []
 
-        if len(mems) < len(sel):
-            self.logger.info(f"[Search] get_memories: {len(sel)}\u2192{len(mems)}")
-
-        if enabled_sources:
-            pre_src = len(mems)
-            mems = {
-                i: m
-                for i, m in mems.items()
-                if m.get("metadata", {}).get("source") in enabled_sources
+        # Build lightweight candidates
+        candidates = [
+            {
+                "hdv_idx": idx,
+                "hdc_score": sc,
+                "token_count": int(self._token_counts[idx]),
+                "source": self._source_map.get(idx, ""),
             }
-            if len(mems) < pre_src:
-                self.logger.info(f"[Search] source filter: {pre_src}\u2192{len(mems)}")
-
-        results = [
-            {"memory": mems[i], "hdc_score": smap.get(i, 0.0)} for i in sel if i in mems
+            for idx, sc in zip(indices.tolist(), scores.tolist())
+            if not enabled_sources or self._source_map.get(idx, "") in enabled_sources
         ]
-        results = self._dedup(results)
-        if len(results) > 1:
-            results = self._hdc_mmr(results, bm["pos"], bm["neg"], token_budget)
-        return results
+        if not candidates:
+            return []
 
+        if len(candidates) > 1:
+            # 2. Adaptive threshold
+            net_scores = np.array([c["hdc_score"] for c in candidates], np.float32)
+            thr = adaptive_threshold(net_scores)
+            if thr and thr != 0.0:
+                keep = net_scores >= thr
+                if 0 < keep.sum() < len(candidates):
+                    self.logger.info(
+                        f"[Adaptive Threshold] {len(candidates)}→{int(keep.sum())} "
+                        f"(thr={thr:.3f}, range=[{net_scores.min():.3f},{net_scores.max():.3f}])"
+                    )
+                    candidates = [c for c, k in zip(candidates, keep) if k]
 
-# ── HdRAG Orchestrator ────────────────────────────────────────────
+            # 3. MMR diversity selection
+            if len(candidates) > 1:
+                bm_indices = [c["hdv_idx"] for c in candidates]
+                dp64, dn64, lit = self.db.get_search_arrays(bm_indices)
+                candidates = self._mmr(
+                    candidates, bm["pos"], bm["neg"], dp64, dn64, lit, token_budget
+                )
+
+        # 4. Deferred text fetch
+        final_idxs = [c["hdv_idx"] for c in candidates]
+        mems = self.db.get_memories(final_idxs)
+
+        return [
+            {"memory": mems[c["hdv_idx"]], "hdc_score": c["hdc_score"]}
+            for c in candidates
+            if c["hdv_idx"] in mems
+        ]
 
 
 class HdRAG:
-    """Hyperdimensional RAG memory engine.
-
-    Accepts any object satisfying the Tokenizer protocol (typically
-    an InferenceEngine instance). Has zero knowledge of the inference
-    pipeline, Gradio UI, or conversation logging.
-    """
+    """Hyperdimensional RAG memory engine."""
 
     def __init__(
         self,
         config: Config,
         tokenizer: Tokenizer,
-        gguf_path: str = "",
         logger: logging.Logger = None,
     ):
         self.config = config
         self._tokenizer = tokenizer
-        self._gguf_path = gguf_path
         self.logger = logger or logging.getLogger(__name__)
-
         self._hdrag_dir = Path(config.hdrag_dir)
         self._hdrag_dir.mkdir(parents=True, exist_ok=True)
-
         self.db = Database(self._hdrag_dir / "index.db", config, self.logger)
         self.hdc = HDCEncoder(config, self._hdrag_dir, self.db)
         self.retriever = Retriever(self.db, self.hdc, tokenizer, config, self.logger)
         self.enabled_sources: set[str] = set(self.db.source_counts())
-
-        # Load IDF weights into tensor registry if index exists
-        if self.hdc.idf:
-            EmbeddingExtractor.set_idf_weights(
-                self.hdc.idf,
-                tokenizer.vocab_size,
-                tokenizer.special_ids,
-            )
-
+        self._init_idf_weights(tokenizer)
         self.logger.info(f"HdRAG initialized: {self.db.count():,} memories")
 
-    # ── Retrieval ──
+    def _init_idf_weights(self, tokenizer: Tokenizer):
+        if not self.hdc.idf:
+            return
+        if self.db.vocab_file.exists():
+            self.hdc.compute_token_weights(tokenizer.vocab_size, tokenizer.special_ids)
+        else:
+            w = np.ones(tokenizer.vocab_size, dtype=np.float32)
+            vocab_arr = np.array(
+                [t for t in self.hdc.idf if 0 <= t < tokenizer.vocab_size], np.int64
+            )
+            w[vocab_arr] = np.array([self.hdc.idf[t] for t in vocab_arr], np.float32)
+            special_arr = np.array(
+                [t for t in tokenizer.special_ids if 0 <= t < tokenizer.vocab_size],
+                np.int64,
+            )
+            if len(special_arr):
+                w[special_arr] = 0.0
+            _arrays.set("idf_weights", w)
 
     def search(
         self, query: str, token_budget: int = None, track: bool = True
     ) -> list[dict]:
-        return self.retriever.search(
+        results = self.retriever.search(
             query,
             token_budget or self.config.max_context_tokens,
             track,
             self.enabled_sources,
         )
+        self.compact()
+        return results
 
     def get_context(
         self, query: str, token_budget: int = None, track: bool = True
@@ -1521,20 +1880,8 @@ class HdRAG:
             r["memory"]["text"] for r in self.search(query, token_budget, track)
         )
 
-    # ── Conversation state ──
-
-    def add_turn(self, text: str):
-        self.retriever.add_turn(text)
-
-    def clear_turns(self):
-        self.retriever.clear_turns()
-
-    # ── Source filtering ──
-
     def source_counts(self) -> dict[str, int]:
         return self.db.source_counts()
-
-    # ── Introspection ──
 
     @property
     def count(self) -> int:
@@ -1549,56 +1896,55 @@ class HdRAG:
             "hdc_ngram": self.config.hdc_ngram,
             "model": Path(self.config.gguf_model).stem,
             "sources": self.db.source_counts(),
-            "tensors": list(_T.keys()),
+            "arrays": _arrays.keys(),
+            "array_mb": _arrays.nbytes() / 1e6,
             "db": self.db.stats(),
         }
 
-    # ── Resource management ──
-
-    def trim_memory(self, *child_procs):
-        gc.collect()
-        trim_working_set(*child_procs)
-
-    # ── Indexing ──
+    def compact(self, *child_procs):
+        """Release encoding memory, trim working set."""
+        self.hdc.compact()
+        self.retriever._eligible_cache = None
+        soft_trim()
 
     def clear_index(self, *child_procs):
-        gc.collect()
-        trim_working_set(*child_procs)
         self.db.clear()
         self.hdc.clear()
-        self.logger.info("Index cleared")
 
     def build_index(self, progress_cb: Callable = None) -> int:
-        """Full rebuild: clear existing index, scan datasets, encode, store.
-
-        Returns number of documents indexed.
-        """
-        if not self._gguf_path:
-            raise FileNotFoundError(
-                "GGUF path required for embedding extraction during indexing"
-            )
-
-        emb = EmbeddingExtractor(self._gguf_path, self._hdrag_dir, self.logger)
-        emb.ensure()
-
         files = discover_datasets(Path(self.config.datasets_dir))
         if not files:
-            emb.release()
             return 0
+        docs = self._pass1_vocabulary(files, progress_cb)
+        if not docs:
+            return 0
+        self._pass2_encode(docs, progress_cb)
+        return len(docs)
 
-        self.logger.info("Clearing existing index...")
-        for a in ("_vocab_f16", "_vocab_ng_u8", "_vocab_ng64", "_vocab_bag"):
-            if hasattr(self.hdc, a):
-                delattr(self.hdc, a)
-        gc.collect()
-        for f in (self.db.corpus_file, self.db.vocab_file):
+    def _clear_for_rebuild(self):
+        """Release all caches and delete index files before a full rebuild."""
+        if hasattr(self.hdc, "_vocab_f16"):
+            delattr(self.hdc, "_vocab_f16")
+        self.hdc._vocab_t = None
+        self.db.invalidate_corpus()
+        trim_memory()
+        for f in (
+            self.db.corpus_file,
+            self.db.vocab_file,
+            self.db.lit_file,
+            self.db.uni_lit_file,
+            self.db.ngram_lit_file,
+        ):
             if f.exists():
                 f.unlink()
         self.db.clear()
 
+    def _pass1_vocabulary(self, files, progress_cb) -> list[dict]:
+        """Pass 1: tokenize all documents and build document-frequency table."""
+        self.logger.info("Clearing existing index...")
+        self._clear_for_rebuild()
         self.logger.info("Pass 1: Building vocabulary...")
 
-        # Start server in CPU-only mode for tokenization (no GPU memory)
         if hasattr(self._tokenizer, "start_for_indexing"):
             self._tokenizer.start_for_indexing()
 
@@ -1612,7 +1958,7 @@ class HdRAG:
             for item in iter_dataset(
                 path,
                 self._tokenizer,
-                self.config.max_context_tokens,
+                self.config.max_context_tokens // self.config.min_context,
             ):
                 if "chunk_idx" in item:
                     text = item["text"].strip()
@@ -1632,36 +1978,45 @@ class HdRAG:
             self.logger.info(f"  [{name}] {count:,} records")
             if progress_cb:
                 progress_cb((fi + 1) / len(files) * 0.3, f"Pass 1: {name}")
+            trim_memory()
 
-        seen, unique = set(), []
-        for d in docs:
-            if d["id"] not in seen:
-                seen.add(d["id"])
-                unique.append(d)
-        docs = unique
+        # Deduplicate
+        seen = set()
+        docs = [d for d in docs if d["id"] not in seen and not seen.add(d["id"])]
         if not docs:
             self.logger.info("No new documents")
-            emb.release()
-            return 0
+            return []
 
         self.logger.info(f"Full rebuild: {len(docs):,} documents")
-
-        # Free GPU memory — tokenization is done, encoding needs the GPU.
-        # Server restarts automatically on next tokenize() or generate().
         if hasattr(self._tokenizer, "stop_server"):
             self._tokenizer.stop_server()
 
-        self.db.set_config("hdc_seed", self.config.hdc_seed)
-        self.db.set_config("hdc_ngram", self.config.hdc_ngram)
-
+        # Persist IDF
         n_docs = len(docs)
         idf = {tid: math.log((n_docs + 1) / (df + 1)) for tid, df in vocab_df.items()}
         self.db.save_idf(dict(vocab_df), n_docs)
+        self.db.set_config("hdc_seed", self.config.hdc_seed)
+        self.db.set_config("hdc_ngram", self.config.hdc_ngram)
         self.db.set_config(
-            "median_doc_length",
-            statistics.median(d["token_count"] for d in docs),
+            "median_doc_length", statistics.median(d["token_count"] for d in docs)
         )
 
+        # Prepare encoder
+        self.hdc.idf = idf
+        self.hdc.median_doc_length = self.db.get_config("median_doc_length")
+        self.hdc._build_remap()
+        self.logger.info(
+            f"Corpus vocab: {len(self.hdc._corpus_vocab):,}/{self._tokenizer.vocab_size:,}"
+        )
+        self.hdc.build_vocab_index()
+        self.hdc.compute_token_weights(
+            self._tokenizer.vocab_size, self._tokenizer.special_ids
+        )
+
+        return docs
+
+    def _pass2_encode(self, docs, progress_cb):
+        """Pass 2: encode all documents into ternary bitmaps and write corpus."""
         all_tids = np.concatenate([d["token_ids"] for d in docs])
         tid_offsets = np.zeros(len(docs) + 1, dtype=np.int64)
         np.cumsum([len(d["token_ids"]) for d in docs], out=tid_offsets[1:])
@@ -1671,54 +2026,83 @@ class HdRAG:
             f"Token IDs: {len(all_tids):,} tokens, {all_tids.nbytes / 1e6:.0f}MB"
         )
 
-        self.hdc.idf = idf
-        self.hdc.median_doc_length = self.db.get_config("median_doc_length")
-        EmbeddingExtractor.set_idf_weights(
-            idf, self._tokenizer.vocab_size, self._tokenizer.special_ids
-        )
-        self.hdc._build_remap()
-        self.logger.info(
-            f"Corpus vocab: {len(self.hdc._corpus_vocab):,}"
-            f"/{self._tokenizer.vocab_size:,}"
-        )
-        self.hdc.build_vocab_index()
-
-        emb.release()
-        self.logger.info("Freed embedding table")
-
+        trim_memory()
+        self.hdc.load_vocab_full()
         self.logger.info(f"Pass 2: Encoding (ngram={self.config.hdc_ngram})...")
+
         bs = self.config.batch_size
-        nb = (len(docs) + bs - 1) // bs
+        n_total = len(docs)
+        nb = (n_total + bs - 1) // bs
+        stride = self.db._stride
 
-        for i, start in enumerate(range(0, len(docs), bs)):
-            end = min(start + bs, len(docs))
-            batch_flat = all_tids[tid_offsets[start] : tid_offsets[end]]
-            batch_offs = tid_offsets[start : end + 1] - tid_offsets[start]
-            bitmaps = self.hdc.encode(flat_ids=batch_flat, offsets=batch_offs)
-            self.db.insert(
-                [
-                    {k: d[k] for k in ("id", "text", "metadata", "token_count")}
-                    for d in docs[start:end]
-                ],
-                bitmaps,
-            )
-            if (i + 1) % self.config.batch_log_interval == 0 or i + 1 == nb:
-                self.logger.info(
-                    f"  Batch {i + 1:,}/{nb:,} ({100 * (i + 1) / nb:.0f}%)"
+        tmp_pos = self.db.corpus_file.with_suffix(".pos.tmp")
+        tmp_neg = self.db.corpus_file.with_suffix(".neg.tmp")
+        self.db.set_config("corpus_layout", "blocked")
+
+        all_lit = np.empty(n_total, dtype=np.float32)
+        all_uni_lit = np.empty(n_total, dtype=np.float32)
+        all_ngram_lit = np.empty(n_total, dtype=np.float32)
+
+        with open(tmp_pos, "wb") as fp, open(tmp_neg, "wb") as fn:
+            for i, start in enumerate(range(0, n_total, bs)):
+                end = min(start + bs, n_total)
+                batch_flat = all_tids[tid_offsets[start] : tid_offsets[end]]
+                batch_offs = tid_offsets[start : end + 1] - tid_offsets[start]
+                bitmaps = self.hdc.encode(flat_ids=batch_flat, offsets=batch_offs)
+                self.db.insert_rows(
+                    [
+                        {k: d[k] for k in ("id", "text", "metadata", "token_count")}
+                        for d in docs[start:end]
+                    ],
+                    bitmaps,
+                    start,
                 )
-            if (i + 1) % self.config.batch_log_interval == 0:
-                gc.collect()
-            if progress_cb:
-                progress_cb(0.3 + (i + 1) / nb * 0.7, f"Pass 2: batch {i + 1}")
+                fp.write(bitmaps["pos"].tobytes())
+                fn.write(bitmaps["neg"].tobytes())
 
-        del all_tids, tid_offsets
+                bsz = end - start
+                p64 = bitmaps["pos"].reshape(bsz, stride).view(np.uint64)
+                n64 = bitmaps["neg"].reshape(bsz, stride).view(np.uint64)
+                all_lit[start:end] = np.bitwise_count(p64 | n64).sum(
+                    axis=1, dtype=np.float32
+                )
+                all_uni_lit[start:end] = bitmaps["lit_uni"].astype(np.float32)
+                all_ngram_lit[start:end] = bitmaps.get(
+                    "lit_ngram", np.zeros(bsz, np.int32)
+                ).astype(np.float32)
+
+                if (i + 1) % self.config.batch_log_interval == 0 or i + 1 == nb:
+                    self.logger.info(
+                        f"  Batch {i + 1:,}/{nb:,} ({100 * (i + 1) / nb:.0f}%)"
+                    )
+                    trim_memory()
+                if progress_cb:
+                    progress_cb(0.3 + (i + 1) / nb * 0.7, f"Pass 2: batch {i + 1}")
+
+        # Concatenate pos + neg into final blocked corpus file
+        with open(self.db.corpus_file, "wb") as out:
+            for tmp in (tmp_pos, tmp_neg):
+                with open(tmp, "rb") as src:
+                    while chunk := src.read(1 << 20):
+                        out.write(chunk)
+                tmp.unlink()
+
+        all_lit.tofile(self.db.lit_file)
+        all_uni_lit.tofile(self.db.uni_lit_file)
+        all_ngram_lit.tofile(self.db.ngram_lit_file)
+        del all_lit, all_uni_lit, all_ngram_lit, all_tids, tid_offsets
+
         self.db.finalize_index()
         self.retriever._token_counts = self.db.get_token_counts()
+        self.retriever._source_map = self.db.get_source_map()
+        self.retriever._eligible_cache = None
+        self.hdc.release_vocab_full()
         self.hdc.release_workspace()
         self.enabled_sources = set(self.db.source_counts())
-        gc.collect()
+        self.db.release_mmap_pages()
+        self.hdc.deep_compact()
+        trim_memory()
         self.logger.info(f"Index complete: {self.db.count():,} memories")
-        return len(docs)
 
     def _ingest(self, items, source, special, vocab_df, docs) -> int:
         texts, metas = zip(*items)
@@ -1739,12 +2123,12 @@ class HdRAG:
         if not new:
             return 0
 
-        new_texts = [txt for _, txt, _ in new]
-        all_toks = self._tokenizer.bulk_tokenize(new_texts)
+        stripped = [strip_structural_keys(txt) for _, txt, _ in new]
+        all_toks = self._tokenizer.bulk_tokenize(stripped)
 
         for (mid, text, meta), toks in zip(new, all_toks):
             if not toks:
-                continue  # tokenization failed (500) — skip
+                continue
             vocab_df.update(set(toks) - special)
             doc_meta = {"source": source}
             if meta:

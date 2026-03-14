@@ -8,7 +8,9 @@ to the HDC memory engine.
 
 from __future__ import annotations
 
-import argparse, json, logging
+import argparse
+import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -19,16 +21,13 @@ from plotly.subplots import make_subplots
 
 from hdrag_model import (
     Config,
+    HuggingFaceTokenizer,
     LlamaServer,
     InferenceEngine,
     ConversationLogger,
     resolve_gguf,
-    trim_working_set,
 )
-from hdrag import HdRAG, compress_context
-
-
-# ── Gradio Application ────────────────────────────────────────────
+from hdrag import HdRAG
 
 
 def create_gradio_app(
@@ -70,7 +69,7 @@ def create_gradio_app(
                 clear_btn = gr.Button("New Conversation")
                 use_mem = gr.Checkbox(value=True, label="Use Memory")
                 top_only = gr.Checkbox(value=False, label="Top Document")
-                compress_cb = gr.Checkbox(value=False, label="Compress Context")
+                resp_hist_cb = gr.Checkbox(value=False, label="Response History")
 
             with gr.Accordion("\U0001f50d Debug: Request Viewer", open=False):
                 debug_out = gr.Code(
@@ -80,7 +79,7 @@ def create_gradio_app(
                     value="Send a message to see the request...",
                 )
 
-            def respond(message, history, bgt, mem, top1, comp):
+            def respond(message, history, bgt, mem, top1, resp_hist):
                 if not message.strip():
                     yield "", history, ""
                     return
@@ -95,32 +94,53 @@ def create_gradio_app(
                 yield "", history, f"\U0001f50d Query: {message}"
 
                 # ── Memory retrieval (only if requested) ──
-                past = history[:-2]
-                if not past:
-                    hdrag.clear_turns()
                 memory = ""
                 if mem and hdrag.count > 0:
                     if top1:
-                        # Single highest-scoring document — focused priming.
-                        # Full pipeline still runs (encode, blend, prune,
-                        # threshold, dedup, _hdc_mmr) so conversation state
-                        # is maintained, but only the top result is used.
                         results = hdrag.search(message, bgt, track=True)
                         if results:
                             memory = results[0]["memory"]["text"]
                     else:
                         memory = hdrag.get_context(message, bgt, track=True)
-                    if comp and memory:
-                        memory = compress_context(memory)
-
-                # ── Pure inference from here — zero hdrag calls ──
-                ctx = config.llama_context_size
+                ctx = inference.context_length
                 gen_budget = config.max_new_tokens
-
                 sys_prompt = inference.build_system_prompt(memory)
                 sys_tokens = inference.count_tokens(sys_prompt)
                 msg_tokens = inference.count_tokens(message)
                 framing = 4  # ~4 tokens per message for chat template
+
+                # ── Response history (working memory from past LLM outputs) ──
+                resp_history_text = ""
+                resp_hist_tokens = 0
+                if resp_hist:
+                    past_turns = history[:-2]
+                    resp_budget = max(0, gen_budget - msg_tokens)
+                    resp_parts = []
+                    resp_total = 0
+                    # Newest first — prioritize recent context
+                    for t in reversed(past_turns):
+                        if t["role"] != "assistant":
+                            continue
+                        content = extract(t["content"])
+                        if not content or content == "...":
+                            continue
+                        n = inference.count_tokens(content) + 1  # +1 for separator
+                        if resp_total + n > resp_budget:
+                            break
+                        resp_parts.append(content)
+                        resp_total += n
+                    if resp_parts:
+                        resp_parts.reverse()  # restore chronological order
+                        resp_history_text = "\n\n".join(resp_parts)
+                        resp_hist_tokens = resp_total
+                        # Inject into system prompt and reduce gen headroom
+                        sys_prompt += (
+                            f"\n\n<response_history>\n"
+                            f"{resp_history_text}\n"
+                            f"</response_history>"
+                        )
+                        sys_tokens = inference.count_tokens(sys_prompt)
+                        gen_budget = max(256, gen_budget - resp_hist_tokens)
 
                 fixed = sys_tokens + msg_tokens + gen_budget + framing * 3
                 hist_budget = ctx - fixed
@@ -144,15 +164,7 @@ def create_gradio_app(
                 ]
                 msgs.append({"role": "user", "content": message})
 
-                response = inference.generate(msgs)
-                history[-1] = {"role": "assistant", "content": response}
-
-                # Post-generation state updates
-                if mem:
-                    hdrag.add_turn(response)
-                chat_log.log(message, response)
-                hdrag.trim_memory(server.process)
-
+                # Build debug info before streaming starts
                 debug_json = (
                     json.dumps(msgs, indent=2).replace("\\n", "\n").replace("\\t", "\t")
                 )
@@ -163,112 +175,62 @@ def create_gradio_app(
                     f"({n_hist} turns, {n_dropped} dropped) "
                     f"msg={msg_tokens} gen={gen_budget}"
                 )
-                yield (
-                    "",
-                    history,
-                    (
-                        f"\U0001f50d Query: {message}\n"
-                        f"\U0001f4ca Budget: {budget_info}"
-                        f"\n\n\U0001f916 Messages:\n{debug_json}"
-                    ),
+                if resp_hist_tokens > 0:
+                    budget_info += f" resp_hist={resp_hist_tokens}"
+                debug_text = (
+                    f"\U0001f50d Query: {message}\n"
+                    f"\U0001f4ca Budget: {budget_info}"
+                    f"\n\n\U0001f916 Messages:\n{debug_json}"
                 )
 
+                # Stream tokens into the chatbot
+                response = ""
+                for chunk in inference.generate_stream(msgs):
+                    response += chunk
+                    history[-1] = {"role": "assistant", "content": response}
+                    yield "", history, debug_text
+
+                chat_log.log(message, response)
+                server.clear_kv_cache()
+                hdrag.compact(server.process)
+
             def clear():
-                hdrag.clear_turns()
                 chat_log.new_conversation()
                 return [], "Send a message to see the request..."
 
-            chat_io = [msg, chatbot, budget, use_mem, top_only, compress_cb]
+            chat_io = [
+                msg,
+                chatbot,
+                budget,
+                use_mem,
+                top_only,
+                resp_hist_cb,
+            ]
             chat_out = [msg, chatbot, debug_out]
             msg.submit(respond, chat_io, chat_out)
             send_btn.click(respond, chat_io, chat_out)
             clear_btn.click(clear, outputs=[chatbot, debug_out])
 
-        with gr.Tab("\U0001f50d Search"):
-            si = gr.Textbox(label="Query", placeholder="Search memories...")
-            sb = gr.Slider(
-                500,
-                slider_max,
-                value=config.max_context_tokens,
-                step=100,
-                label="Token Budget",
-            )
-            sbtn = gr.Button("Search", variant="primary")
-            sout = gr.JSON(label="Results")
-
-            def do_search(q, b):
-                if not q.strip():
-                    return []
-                return [
-                    {
-                        "score": r["hdc_score"],
-                        "source": r["memory"]["metadata"].get("source", "?"),
-                        "tokens": r["memory"].get("token_count", 0),
-                        "text": r["memory"]["text"][:500]
-                        + ("..." if len(r["memory"]["text"]) > 500 else ""),
-                    }
-                    for r in hdrag.search(q, token_budget=b, track=False)
-                ]
-
-            sbtn.click(do_search, [si, sb], sout)
-
-        with gr.Tab("\u2699\ufe0f Config"):
-            gr.Markdown("## System Configuration")
-            with gr.Accordion("HDC Settings", open=False):
-                c_dims = gr.Slider(
-                    1000,
-                    50000,
-                    value=config.hdc_dimensions,
-                    step=1000,
-                    label="Dimensions",
-                )
-                c_seed = gr.Number(value=config.hdc_seed, label="Seed", precision=0)
-                c_ngram = gr.Slider(
-                    1,
-                    5,
-                    value=config.hdc_ngram,
-                    step=1,
-                    label="N-gram",
-                )
-
-            with gr.Accordion("Retrieval Settings", open=False):
+        with gr.Tab("\u2699\ufe0f Settings"):
+            with gr.Row():
+                c_dims = gr.Number(label="HDC Dimensions", value=config.hdc_dimensions)
+                c_seed = gr.Number(label="HDC Seed", value=config.hdc_seed)
+                c_ngram = gr.Number(label="HDC N-gram", value=config.hdc_ngram)
                 c_ctx = gr.Slider(
                     500,
                     slider_max,
                     value=config.max_context_tokens,
                     step=100,
-                    label="Max Context Tokens",
+                    label="Default Token Budget",
                 )
+            with gr.Row():
+                c_temp = gr.Slider(0, 2, value=config.temperature, label="Temperature")
+                c_topp = gr.Slider(0, 1, value=config.top_p, label="Top P")
+                c_maxt = gr.Number(label="Max New Tokens", value=config.max_new_tokens)
 
-            with gr.Accordion("Model Settings", open=False):
-                gr.Markdown(f"**Model:** `{Path(config.gguf_model).stem}`")
-                c_temp = gr.Slider(
-                    0.0,
-                    2.0,
-                    value=config.temperature,
-                    step=0.05,
-                    label="Temperature",
-                )
-                c_topp = gr.Slider(
-                    0.0,
-                    1.0,
-                    value=config.top_p,
-                    step=0.05,
-                    label="Top P",
-                )
-                c_maxt = gr.Slider(
-                    128,
-                    slider_max,
-                    value=config.max_new_tokens,
-                    step=128,
-                    label="Max Output Tokens",
-                )
-
-            with gr.Accordion("Datasets", open=False):
-                gr.Markdown(f"**Directory:** `{config.datasets_dir}`")
-                sc = hdrag.source_counts()
+            with gr.Accordion("Datasets", open=True):
+                sc = hdrag.db.source_counts()
                 if sc:
-                    gr.Markdown("**Select datasets to include in search:**")
                     labels = [f"{s} ({n:,})" for s, n in sc.items()]
                     ds_cb = gr.CheckboxGroup(
                         choices=labels,
@@ -434,9 +396,6 @@ def create_gradio_app(
     return app
 
 
-# ── Entry Point ────────────────────────────────────────────────────
-
-
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description="HdRAG")
@@ -444,7 +403,6 @@ def main():
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    # ── Logging ──
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -455,29 +413,23 @@ def main():
         logging.getLogger(name).setLevel(logging.WARNING)
     logger = logging.getLogger("hdrag")
 
-    # ── Config ──
     config_path = args.config
     config = Config.load(config_path)
-
-    # ── GGUF model ──
     gguf_path = resolve_gguf(config.gguf_model, config.model_dir)
     if gguf_path:
         logger.info(f"GGUF resolved: {gguf_path}")
     else:
         logger.warning(f"GGUF '{config.gguf_model}' not found in {config.model_dir}")
 
-    # ── Inference engine (tokenizer + generation) ──
+    tokenizer = HuggingFaceTokenizer.from_gguf(gguf_path, logger=logger)
     server = LlamaServer(config, logger, gguf_path)
-    inference = InferenceEngine(config, logger, server, gguf_path)
-    # Server starts lazily: tokenize-only mode on index, GPU mode on first chat
-
-    # ── Memory engine (uses inference as its tokenizer) ──
-    hdrag = HdRAG(config, tokenizer=inference, gguf_path=gguf_path, logger=logger)
-
-    # ── Conversation logger ──
+    server.start()
+    inference = InferenceEngine(config, logger, server, gguf_path, tokenizer=tokenizer)
+    hdrag = HdRAG(config, tokenizer=tokenizer, logger=logger)
     chat_log = ConversationLogger(config.chat_history_dir)
 
-    # ── Launch ──
+    logger.info(f"Server context: {server.context_length:,} tokens")
+
     create_gradio_app(inference, hdrag, chat_log, config, server, config_path).launch(
         server_port=config.gradio_port
     )
